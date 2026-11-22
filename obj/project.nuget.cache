@@ -1,0 +1,84 @@
+{
+  "version": 2,
+  "dgSpecHash": "t1GtrXFPf2k=",
+  "success": true,
+  "projectFilePath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\hbertorello\\.nuget\\packages\\h264sharp\\1.6.0\\h264sharp.1.6.0.nupkg.sha512",
+    "C:\\Users\\hbertorello\\.nuget\\packages\\sixlabors.imagesharp\\3.1.12\\sixlabors.imagesharp.3.1.12.nupkg.sha512"
+  ],
+  "logs": [
+    {
+      "code": "NU1902",
+      "level": "Warning",
+      "message": "El paquete \"SixLabors.ImageSharp\" 3.1.12 tiene una vulnerabilidad de gravedad moderada conocida, https://github.com/advisories/GHSA-gwg2-r3hj-4w44",
+      "projectPath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "libraryId": "SixLabors.ImageSharp",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    },
+    {
+      "code": "NU1903",
+      "level": "Warning",
+      "message": "El paquete \"SixLabors.ImageSharp\" 3.1.12 tiene una vulnerabilidad de gravedad alta conocida, https://github.com/advisories/GHSA-j3p4-wp97-rph4",
+      "projectPath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "libraryId": "SixLabors.ImageSharp",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    },
+    {
+      "code": "NU1903",
+      "level": "Warning",
+      "message": "El paquete \"SixLabors.ImageSharp\" 3.1.12 tiene una vulnerabilidad de gravedad alta conocida, https://github.com/advisories/GHSA-j9gm-c75j-xc9q",
+      "projectPath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "libraryId": "SixLabors.ImageSharp",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    },
+    {
+      "code": "NU1903",
+      "level": "Warning",
+      "message": "El paquete \"SixLabors.ImageSharp\" 3.1.12 tiene una vulnerabilidad de gravedad alta conocida, https://github.com/advisories/GHSA-jjfr-hcj7-qf5w",
+      "projectPath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "libraryId": "SixLabors.ImageSharp",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    },
+    {
+      "code": "NU1903",
+      "level": "Warning",
+      "message": "El paquete \"SixLabors.ImageSharp\" 3.1.12 tiene una vulnerabilidad de gravedad alta conocida, https://github.com/advisories/GHSA-v76p-62qx-wwq2",
+      "projectPath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "libraryId": "SixLabors.ImageSharp",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    },
+    {
+      "code": "NU1902",
+      "level": "Warning",
+      "message": "El paquete \"SixLabors.ImageSharp\" 3.1.12 tiene una vulnerabilidad de gravedad moderada conocida, https://github.com/advisories/GHSA-wmxv-xphr-5c9g",
+      "projectPath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "libraryId": "SixLabors.ImageSharp",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    }
+  ]
+}

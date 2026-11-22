@@ -1,0 +1,3873 @@
+﻿
+========== C:\c\V380Decoder\src\AppJsonSerializerContext.cs ==========
+
+using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Mvc;
+
+namespace V380Decoder.src
+{
+    [JsonSerializable(typeof(DispatchRequest))]
+    [JsonSerializable(typeof(DispatchResult))]
+    [JsonSerializable(typeof(ProblemDetails))]
+    [JsonSerializable(typeof(StatusResponse))]
+    internal partial class AppJsonSerializerContext : JsonSerializerContext
+    {
+    }
+}
+
+========== C:\c\V380Decoder\src\ArgParser.cs ==========
+
+namespace V380Decoder.src
+{
+    public class ArgParser
+    {
+        public static T GetArg<T>(string[] args, string key, T defaultValue)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (string.Equals(args[i], key, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (typeof(T) == typeof(bool))
+                        return (T)Convert.ChangeType(true, typeof(T));
+
+                    if (i + 1 < args.Length)
+                    {
+                        var valueStr = args[i + 1];
+
+                        if (typeof(T) == typeof(string))
+                            return (T)(object)valueStr;
+
+                        try
+                        {
+                            return (T)Convert.ChangeType(valueStr, typeof(T));
+                        }
+                        catch
+                        {
+                            throw new ArgumentException(
+                                $"{key} must be of type {typeof(T).Name}");
+                        }
+                    }
+
+                    throw new ArgumentException($"{key} requires a value.");
+                }
+            }
+
+            return defaultValue;
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\DeviceDiscovery.cs ==========
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace V380Decoder.src
+{
+    public class DeviceInfo
+    {
+        public string Mac { get; set; }
+        public string DevId { get; set; }
+        public string Ip { get; set; }
+        public string Subnet { get; set; }
+        public string Gateway { get; set; }
+
+    }
+    public class DeviceDiscovery
+    {
+        private List<DeviceInfo> _devices = [];
+
+        public List<DeviceInfo> Discover()
+        {
+            UdpClient udpClient = new();
+            udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, 10009));
+            udpClient.EnableBroadcast = true;
+            udpClient.Client.ReceiveTimeout = 250;
+            try
+            {
+                IPEndPoint broadcastEndpoint = new(IPAddress.Broadcast, 10008);
+                byte[] searchCmd = Encoding.ASCII.GetBytes("NVDEVSEARCH^100");
+                int retry = 5;
+
+                while (retry-- > 0)
+                {
+                    udpClient.Send(searchCmd, searchCmd.Length, broadcastEndpoint);
+
+                    var startTick = Environment.TickCount;
+                    while (Environment.TickCount - startTick < 250)
+                    {
+                        try
+                        {
+                            IPEndPoint remoteEP = null;
+                            byte[] receivedData = udpClient.Receive(ref remoteEP);
+                            string data = Encoding.ASCII.GetString(receivedData);
+                            Parse(data, remoteEP.Address.ToString());
+                        }
+                        catch (SocketException ex)
+                        {
+                            if (ex.SocketErrorCode == SocketError.TimedOut)
+                                break;
+                            Console.Error.WriteLine($"[DISCOVERY] Error receive data: {ex.Message}");
+                        }
+                        catch (TimeoutException)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[DISCOVERY] Error: {ex.Message}");
+            }
+            finally
+            {
+                udpClient.Close();
+                udpClient.Dispose();
+            }
+            return _devices;
+        }
+
+        private void Parse(string data, string sourceIp)
+        {
+            LogUtils.debug($"[DISCOVERY] result: {data}");
+            string[] parts = data.Split('^');
+            if (parts.Length < 13) return;
+            if (parts[0] != "NVDEVRESULT") return;
+
+            string mac = parts[2];
+            foreach (var dev in _devices)
+            {
+                if (dev.Mac == mac)
+                    return;
+            }
+
+            _devices.Add(new DeviceInfo
+            {
+                Mac = mac,
+                DevId = parts[12],
+                Ip = parts[3],
+                Subnet = parts[4],
+                Gateway = parts[5]
+            });
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\DispatchRelayServer.cs ==========
+
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+
+namespace V380Decoder.src
+{
+    public class DispatchRelayServer
+    {
+        private readonly static string dispatchUrl = "http://dispa1.av380.net:8001/api/v1/get_stream_server";
+        private static readonly JsonSerializerOptions _jsonOptions = new()
+        {
+            TypeInfoResolver = AppJsonSerializerContext.Default,
+            PropertyNameCaseInsensitive = true
+        };
+        public static async Task<string> GetServerIPAsync(int deviceId)
+        {
+            long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            int platform = 10001; // 20001 pano device
+            string baseString = $"dev_id={deviceId}&platform={platform}&timestamp={timestamp}hsdata2022";
+            string sign = ComputeSha1Hash(baseString);
+
+            DispatchRequest request = new()
+            {
+                dev_id = deviceId,
+                platform = platform,
+                timestamp = timestamp,
+                sign = sign
+            };
+
+            string json = JsonSerializer.Serialize(request, _jsonOptions);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            using var client = new HttpClient();
+            var response = await client.PostAsync(dispatchUrl, content);
+            if (!response.IsSuccessStatusCode)
+                return string.Empty;
+
+            string responseBody = await response.Content.ReadAsStringAsync();
+            DispatchResult result = JsonSerializer.Deserialize<DispatchResult>(responseBody, _jsonOptions);
+            if (result.code != 2000)
+                return string.Empty;
+
+            foreach (var item in result.data)
+            {
+                if (await IsServerReachableAsync(item.ip, 8800))
+                {
+                    return item.ip;
+                }
+            }
+            return string.Empty;
+        }
+
+        private static string ComputeSha1Hash(string input)
+        {
+            using SHA1 sha1 = SHA1.Create();
+            byte[] hashBytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(input));
+            return BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
+        }
+
+
+        private static async Task<bool> IsServerReachableAsync(string ip, int port, int timeoutMs = 3000)
+        {
+            using var client = new TcpClient();
+            try
+            {
+                var connectTask = client.ConnectAsync(ip, port);
+                var timeoutTask = Task.Delay(timeoutMs);
+                var completedTask = await Task.WhenAny(connectTask, timeoutTask);
+
+                if (completedTask == connectTask && client.Connected)
+                {
+                    return true;
+                }
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\DispatchRequest.cs ==========
+
+
+namespace V380Decoder.src
+{
+    public class DispatchRequest
+    {
+        public int dev_id { get; set; }
+        public int platform { get; set; }
+        public long timestamp { get; set; }
+        public string sign { get; set; }
+    }
+}
+
+========== C:\c\V380Decoder\src\DispatchResult.cs ==========
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace V380Decoder.src
+{
+    public class DispatchResult
+    {
+        public int code { get; set; }
+        public List<DataServer> data { get; set; }
+    }
+
+    public class DataServer
+    {
+        public string ip { get; set; }
+        public string domain { get; set; }
+    }
+}
+
+
+========== C:\c\V380Decoder\src\Enum.cs ==========
+
+namespace V380Decoder.src
+{
+    public enum OutputMode { Video, Audio, Rtsp }
+    public enum SourceStream { Lan, Cloud }
+}
+
+========== C:\c\V380Decoder\src\FrameData.cs ==========
+
+namespace V380Decoder.src
+{
+    public class FrameData
+    {
+        public byte RawType;   // fragment header type byte (0x00/0x01/0x1A)
+        public uint FrameId;
+        public ushort FrameType;
+        public ushort FrameRate;
+        public ulong Timestamp;
+        public byte[] Payload;
+        public bool IsKeyframe => RawType == 0x00;
+    }
+}
+
+========== C:\c\V380Decoder\src\LogUtils.cs ==========
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace V380Decoder.src
+{
+    public class LogUtils
+    {
+        public static bool enableDebug = false;
+
+        public static void debug(string log)
+        {
+            if (enableDebug)
+                Console.Error.WriteLine(log);
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\NetworkHelper.cs ==========
+
+
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+
+namespace V380Decoder.src
+{
+    public class NetworkHelper
+    {
+        public static string GetLocalIPAddress()
+        {
+            try
+            {
+                var ip = GetIPViaUdpConnection();
+                if (ip != null) return ip;
+
+                ip = GetIPFromNetworkInterfaces();
+                if (ip != null) return ip;
+
+                ip = GetIPFromDns();
+                if (ip != null) return ip;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error getting IP: {ex.Message}");
+            }
+
+            return "0.0.0.0";
+        }
+
+        private static string GetIPViaUdpConnection()
+        {
+            try
+            {
+                using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, 0);
+                socket.Connect("8.8.8.8", 65530);
+                var endPoint = socket.LocalEndPoint as IPEndPoint;
+                if (endPoint != null && !IPAddress.IsLoopback(endPoint.Address))
+                {
+                    return endPoint.Address.ToString();
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static string GetIPFromNetworkInterfaces()
+        {
+            try
+            {
+                foreach (var netInterface in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (netInterface.OperationalStatus == OperationalStatus.Up &&
+                        netInterface.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                        netInterface.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                    {
+                        if (IsVirtualInterface(netInterface.Description))
+                            continue;
+
+                        var ipProps = netInterface.GetIPProperties();
+
+                        if (ipProps.GatewayAddresses.Count == 0)
+                            continue;
+
+                        foreach (var addr in ipProps.UnicastAddresses)
+                        {
+                            if (addr.Address.AddressFamily == AddressFamily.InterNetwork &&
+                                !IPAddress.IsLoopback(addr.Address))
+                            {
+                                return addr.Address.ToString();
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static string GetIPFromDns()
+        {
+            try
+            {
+                var host = Dns.GetHostEntry(Dns.GetHostName());
+                return host.AddressList
+                    .FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork &&
+                                         !IPAddress.IsLoopback(ip))?.ToString();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool IsVirtualInterface(string description)
+        {
+            var virtualKeywords = new[] {
+            "virtual", "vmware", "vbox", "docker", "hyper-v",
+            "vEthernet", "bridge", "vnet", "tap", "tun"
+        };
+
+            return virtualKeywords.Any(keyword =>
+                description.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public static int SubnetToPrefixLength(string subnetMask)
+        {
+            var bytes = subnetMask.Split('.').Select(byte.Parse);
+
+            int count = 0;
+
+            foreach (var b in bytes)
+            {
+                int val = b;
+                while (val > 0)
+                {
+                    count += (val & 1);
+                    val >>= 1;
+                }
+            }
+
+            return count;
+        }
+
+    }
+}
+
+========== C:\c\V380Decoder\src\OnvifDiscovery.cs ==========
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+
+namespace V380Decoder.src
+{
+    public class OnvifDiscovery : IDisposable
+    {
+        private readonly int port;
+        private UdpClient udp;
+        private Thread acceptThread;
+        private volatile bool running;
+
+        public OnvifDiscovery(int port) { this.port = port; }
+
+        public void Start()
+        {
+            udp = new UdpClient();
+            udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            udp.Client.Bind(new IPEndPoint(IPAddress.Any, 3702));
+            udp.JoinMulticastGroup(IPAddress.Parse("239.255.255.250"));
+            running = true;
+            acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "onvif-discovery" };
+            acceptThread.Start();
+            LogUtils.debug("[ONVIF] Onvif Discovery listening...");
+        }
+
+        void AcceptLoop()
+        {
+            while (running)
+            {
+                try
+                {
+                    IPEndPoint remoteEP = null;
+                    var result = udp.Receive(ref remoteEP);
+                    var request = Encoding.UTF8.GetString(result);
+                    if (request.Contains("Probe"))
+                    {
+                        LogUtils.debug("[ONVIF] Probe received");
+
+                        var response = BuildProbeMatch(request);
+
+                        var bytes = Encoding.UTF8.GetBytes(response);
+
+                        udp.Send(bytes, bytes.Length, remoteEP);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        static string ExtractMessageId(string xml)
+        {
+            var doc = XDocument.Parse(xml);
+            XNamespace w = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
+
+            return doc.Descendants(w + "MessageID").FirstOrDefault()?.Value ?? "";
+        }
+
+        string BuildProbeMatch(string requestXml)
+        {
+            string messageId = ExtractMessageId(requestXml);
+            string xaddr = $"http://{NetworkHelper.GetLocalIPAddress()}:{port}/onvif/device_service";
+
+            return $@"<?xml version=""1.0"" encoding=""UTF-8""?>
+                <e:Envelope xmlns:e=""http://www.w3.org/2003/05/soap-envelope""
+                            xmlns:w=""http://schemas.xmlsoap.org/ws/2004/08/addressing""
+                            xmlns:d=""http://schemas.xmlsoap.org/ws/2005/04/discovery""
+                            xmlns:dn=""http://www.onvif.org/ver10/network/wsdl"">
+                <e:Header>
+                    <w:MessageID>uuid:{Guid.NewGuid()}</w:MessageID>
+                    <w:RelatesTo>{messageId}</w:RelatesTo>
+                    <w:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</w:To>
+                    <w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</w:Action>
+                </e:Header>
+                <e:Body>
+                    <d:ProbeMatches>
+                    <d:ProbeMatch>
+                        <w:EndpointReference>
+                        <w:Address>{xaddr}</w:Address>
+                        </w:EndpointReference>
+                        <d:Types>dn:NetworkVideoTransmitter</d:Types>
+                        <d:Scopes>
+                        onvif://www.onvif.org/type/video_encoder
+                        onvif://www.onvif.org/Profile/Streaming
+                        </d:Scopes>
+                        <d:XAddrs>{xaddr}</d:XAddrs>
+                        <d:MetadataVersion>1</d:MetadataVersion>
+                    </d:ProbeMatch>
+                    </d:ProbeMatches>
+                </e:Body>
+                </e:Envelope>";
+        }
+
+        public void Dispose()
+        {
+            running = false;
+            try
+            {
+                udp?.Close();
+                udp?.Dispose();
+            }
+            catch { }
+
+            try
+            {
+                if (acceptThread?.IsAlive == true)
+                {
+                    acceptThread.Join(TimeSpan.FromMilliseconds(500));
+                }
+            }
+            catch { }
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\OnvifHandler.cs ==========
+
+using System.Security.Cryptography;
+using System.Text.RegularExpressions;
+using Microsoft.AspNetCore.Http;
+
+namespace V380Decoder.src
+{
+  public class OnvifHandler
+  {
+    private static Timer ptzStopTimer;
+    private static readonly object ptzLock = new();
+
+    public static string Handle(string action, string body, HttpContext ctx, V380Client camera, int httpPort, int rtspPort, bool secure = false, string username = "", string password = "")
+    {
+      if (secure
+          && !Contains(action, body, "GetSystemDateAndTime")
+          && !Contains(action, body, "GetCapabilities")
+          && !Contains(action, body, "GetScopes"))
+      {
+        string securityError = CheckWsSecurity(body, username, password);
+        if (securityError != null)
+        {
+          return SoapFault("SecurityError", securityError);
+        }
+      }
+      if (Contains(action, body, "GetSystemDateAndTime")) return RespGetSystemDateAndTime();
+      else if (Contains(action, body, "GetDeviceInformation")) return RespGetDeviceInformation(camera);
+      else if (Contains(action, body, "GetServices")) return RespGetServices(ctx);
+      else if (Contains(action, body, "GetScopes")) return RespGetScopes();
+      else if (Contains(action, body, "GetNetworkInterfaces")) return RespGetNetworkInterfaces(camera);
+      else if (Contains(action, body, "GetDNS")) return RespGetDNS();
+      else if (Contains(action, body, "GetNTP")) return RespGetNTP();
+      else if (Contains(action, body, "GetHostname")) return RespGetHostname();
+      else if (Contains(action, body, "GetCapabilities")) return RespGetCapabilities(ctx);
+      else if (Contains(action, body, "GetProfiles")) return RespGetProfiles();
+      else if (Contains(action, body, "GetProfile")) return RespGetProfile();
+      else if (Contains(action, body, "GetVideoSources")) return RespGetVideoSources();
+      else if (Contains(action, body, "GetVideoSourceConfigurations")) return RespGetVideoSourceConfigurations();
+      else if (Contains(action, body, "GetVideoSourceConfiguration")) return RespGetVideoSourceConfig();
+      else if (Contains(action, body, "GetVideoEncoderConfigurationOptions")) return RespGetVideoEncoderConfigOptions();
+      else if (Contains(action, body, "GetVideoEncoderConfigurations")) return RespGetVideoEncoderConfigurations();
+      else if (Contains(action, body, "GetVideoEncoderConfiguration")) return RespGetVideoEncoderConfig();
+      else if (Contains(action, body, "GetAudioSources")) return RespGetAudioSources();
+      else if (Contains(action, body, "GetAudioSourceConfigurations")) return RespGetAudioSourceConfigurations();
+      else if (Contains(action, body, "GetAudioSourceConfiguration")) return RespGetAudioSourceConfig();
+      else if (Contains(action, body, "GetAudioEncoderConfigurationOptions")) return RespGetAudioEncoderConfigOptions();
+      else if (Contains(action, body, "GetAudioEncoderConfigurations")) return RespGetAudioEncoderConfigurations();
+      else if (Contains(action, body, "GetAudioEncoderConfiguration")) return RespGetAudioEncoderConfig();
+      else if (Contains(action, body, "GetServiceCapabilities")) return RespServiceCapabilities(ctx);
+      else if (Contains(action, body, "GetPresets")) return RespGetPresets();
+      else if (Contains(action, body, "GetNodes")) return RespGetNodes();
+      else if (Contains(action, body, "GetConfigurationOptions")) return RespGetConfigOptions();
+      else if (Contains(action, body, "GetConfigurations")) return RespGetConfigurations();
+      else if (Contains(action, body, "GetConfiguration")) return RespGetConfigurations();
+      else if (Contains(action, body, "GetStatus")) return RespGetStatus();
+      else if (Contains(action, body, "ContinuousMove")) return HandleContinuousMove(body, camera);
+      else if (Contains(action, body, "AbsoluteMove")) return SoapOk("AbsoluteMove");
+      else if (Contains(action, body, "RelativeMove")) return SoapOk("RelativeMove");
+      else if (Contains(action, body, "GotoHomePosition")) return SoapOk("GotoHomePosition");
+      else if (Contains(action, body, "SetPreset")) return SoapOk("SetPreset");
+      else if (Contains(action, body, "RemovePreset")) return SoapOk("RemovePreset");
+      else if (Contains(action, body, "Stop")) return HandleStop(camera);
+      else if (Contains(action, body, "SetImagingSettings")) return HandleSetImaging(body, camera);
+      else if (Contains(action, body, "GetImagingSettings")) return RespGetImagingSettings();
+      else if (Contains(action, body, "GetMoveOptions")) return RespGetMoveOptions();
+      else if (Contains(action, body, "GetOptions")) return RespGetImagingOptions();
+      else if (Contains(action, body, "GetStreamUri")) return RespGetStreamUri(ctx, rtspPort);
+      else if (Contains(action, body, "GetSnapshotUri")) return RespGetSnapshotUri(ctx, httpPort);
+      else if (Contains(action, body, "GetNetworkProtocols")) return RespGetGetNetworkProtocols(httpPort, rtspPort);
+      else if (Contains(action, body, "GetNetworkDefaultGateway")) return RespGetNetworkDefaultGateway(camera);
+      else if (Contains(action, body, "GetDiscoveryMode")) return RespGetDiscoveryMode();
+      else
+      {
+        LogUtils.debug($"[ONVIF] !! Unhandled: {action}");
+        return SoapFault("ActionNotSupported", action);
+      }
+    }
+
+
+    private static string CheckWsSecurity(string body, string expectedUsername, string expectedPassword)
+    {
+      var usernameMatch = Regex.Match(body, @"<(?:\w+:)?Username[^>]*>([^<]*)</(?:\w+:)?Username>", RegexOptions.IgnoreCase);
+      var passwordMatch = Regex.Match(body, @"<(?:\w+:)?Password[^>]*>([^<]*)</(?:\w+:)?Password>", RegexOptions.IgnoreCase);
+      var nonceMatch = Regex.Match(body, @"<(?:\w+:)?Nonce[^>]*>([^<]*)</(?:\w+:)?Nonce>", RegexOptions.IgnoreCase);
+      var createdMatch = Regex.Match(body, @"<(?:\w+:)?Created[^>]*>([^<]*)</(?:\w+:)?Created>", RegexOptions.IgnoreCase);
+      var passwordTypeMatch = Regex.Match(body, @"<(?:\w+:)?Password[^>]*Type=""([^""]*)""", RegexOptions.IgnoreCase);
+
+      if (!usernameMatch.Success || !passwordMatch.Success)
+      {
+        return "Missing UsernameToken credentials";
+      }
+
+      string username = usernameMatch.Groups[1].Value;
+      string receivedDigest = passwordMatch.Groups[1].Value;
+
+      if (username != expectedUsername)
+      {
+        return "Invalid username";
+      }
+
+      bool isDigest = passwordTypeMatch.Success &&
+                      passwordTypeMatch.Groups[1].Value.Contains("PasswordDigest", StringComparison.OrdinalIgnoreCase);
+
+      if (isDigest)
+      {
+        if (!nonceMatch.Success || !createdMatch.Success)
+        {
+          return "PasswordDigest requires Nonce and Created";
+        }
+
+        string nonce = nonceMatch.Groups[1].Value;
+        string created = createdMatch.Groups[1].Value;
+
+        try
+        {
+          byte[] nonceBytes = Convert.FromBase64String(nonce);
+          byte[] createdBytes = System.Text.Encoding.UTF8.GetBytes(created);
+          byte[] passwordBytes = System.Text.Encoding.UTF8.GetBytes(expectedPassword);
+
+          using (var sha1 = SHA1.Create())
+          {
+            byte[] combined = new byte[nonceBytes.Length + createdBytes.Length + passwordBytes.Length];
+            Buffer.BlockCopy(nonceBytes, 0, combined, 0, nonceBytes.Length);
+            Buffer.BlockCopy(createdBytes, 0, combined, nonceBytes.Length, createdBytes.Length);
+            Buffer.BlockCopy(passwordBytes, 0, combined, nonceBytes.Length + createdBytes.Length, passwordBytes.Length);
+
+            byte[] computed = sha1.ComputeHash(combined);
+            string computedDigest = Convert.ToBase64String(computed);
+
+            if (receivedDigest != computedDigest)
+            {
+              return "Invalid password digest";
+            }
+          }
+        }
+        catch (Exception ex)
+        {
+          return $"PasswordDigest validation error: {ex.Message}";
+        }
+      }
+      else
+      {
+        if (receivedDigest != expectedPassword)
+        {
+          return "Invalid password";
+        }
+      }
+
+      return null;
+    }
+
+    private static string HandleContinuousMove(string body, V380Client camera)
+    {
+      float x = ParseFloat(body, "x");
+      float y = ParseFloat(body, "y");
+      float durationSec = ParseFloat(body, "Timeout", 1.0f);
+      int durationMs = Math.Clamp((int)(durationSec * 1000), 100, 5000);
+
+      lock (ptzLock)
+      {
+        ptzStopTimer?.Dispose();
+
+        if (x > 0.1f) { camera.PtzRight(); LogUtils.debug("[ONVIF] PTZ â†’ RIGHT"); }
+        else if (x < -0.1f) { camera.PtzLeft(); LogUtils.debug("[ONVIF] PTZ â†’ LEFT"); }
+        else if (y > 0.1f) { camera.PtzUp(); LogUtils.debug("[ONVIF] PTZ â†’ UP"); }
+        else if (y < -0.1f) { camera.PtzDown(); LogUtils.debug("[ONVIF] PTZ â†’ DOWN"); }
+
+        ptzStopTimer = new Timer(_ => camera.PtzStop(), null, durationMs, Timeout.Infinite);
+      }
+
+      return SoapOk("ContinuousMove");
+    }
+
+    private static string HandleStop(V380Client camera)
+    {
+      lock (ptzLock)
+      {
+        ptzStopTimer?.Dispose();
+        camera.PtzStop();
+      }
+      LogUtils.debug("[ONVIF] PTZ â†’ STOP");
+      return SoapOk("Stop");
+    }
+
+    private static string HandleSetImaging(string body, V380Client camera)
+    {
+      string ir = ParseTag(body, "IrCutFilter").ToUpper();
+      switch (ir)
+      {
+        case "ON": camera.LightOn(); LogUtils.debug("[ONVIF] Light â†’ ON"); break;
+        case "OFF": camera.LightOff(); LogUtils.debug("[ONVIF] Light â†’ OFF"); break;
+        default: camera.LightAuto(); LogUtils.debug("[ONVIF] Light â†’ AUTO"); break;
+      }
+      return SoapOk("SetImagingSettings");
+    }
+
+    private static string RespGetSystemDateAndTime()
+    {
+      var now = DateTime.UtcNow;
+      return Envelope($@"
+              <tds:GetSystemDateAndTimeResponse>
+                <tds:SystemDateAndTime>
+                  <tt:DateTimeType>NTP</tt:DateTimeType>
+                  <tt:DaylightSavings>false</tt:DaylightSavings>
+                  <tt:TimeZone><tt:TZ>UTC</tt:TZ></tt:TimeZone>
+                  <tt:UTCDateTime>
+                    <tt:Time>
+                      <tt:Hour>{now.Hour}</tt:Hour>
+                      <tt:Minute>{now.Minute}</tt:Minute>
+                      <tt:Second>{now.Second}</tt:Second>
+                    </tt:Time>
+                    <tt:Date>
+                      <tt:Year>{now.Year}</tt:Year>
+                      <tt:Month>{now.Month}</tt:Month>
+                      <tt:Day>{now.Day}</tt:Day>
+                    </tt:Date>
+                  </tt:UTCDateTime>
+                </tds:SystemDateAndTime>
+              </tds:GetSystemDateAndTimeResponse>");
+    }
+
+    private static string RespGetDeviceInformation(V380Client camera) => Envelope($@"
+              <tds:GetDeviceInformationResponse>
+                <tds:Manufacturer>V380</tds:Manufacturer>
+                <tds:Model>V380 Pro</tds:Model>
+                <tds:FirmwareVersion>1.0.0</tds:FirmwareVersion>
+                <tds:SerialNumber>{camera.GetDeviceId()}</tds:SerialNumber>
+                <tds:HardwareId>{camera.GetDeviceVersion()}</tds:HardwareId>
+              </tds:GetDeviceInformationResponse>");
+
+    private static string RespGetServices(HttpContext ctx)
+    {
+      string host = ctx.Request.Host.ToString();
+      return Envelope($@"
+              <tds:GetServicesResponse>
+                <tds:Service>
+                  <tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace>
+                  <tds:XAddr>http://{host}/onvif/device_service</tds:XAddr>
+                  <tds:Version><tt:Major>2</tt:Major><tt:Minor>60</tt:Minor></tds:Version>
+                </tds:Service>
+                <tds:Service>
+                  <tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>
+                  <tds:XAddr>http://{host}/onvif/media_service</tds:XAddr>
+                  <tds:Version><tt:Major>2</tt:Major><tt:Minor>60</tt:Minor></tds:Version>
+                </tds:Service>
+                <tds:Service>
+                  <tds:Namespace>http://www.onvif.org/ver10/ptz/wsdl</tds:Namespace>
+                  <tds:XAddr>http://{host}/onvif/ptz_service</tds:XAddr>
+                  <tds:Version><tt:Major>2</tt:Major><tt:Minor>60</tt:Minor></tds:Version>
+                </tds:Service>
+                <tds:Service>
+                  <tds:Namespace>http://www.onvif.org/ver20/imaging/wsdl</tds:Namespace>
+                  <tds:XAddr>http://{host}/onvif/imaging_service</tds:XAddr>
+                  <tds:Version><tt:Major>2</tt:Major><tt:Minor>60</tt:Minor></tds:Version>
+                </tds:Service>
+              </tds:GetServicesResponse>");
+    }
+
+    private static string RespGetScopes() => Envelope(@"
+              <tds:GetScopesResponse>
+                <tds:Scopes>
+                  <tt:ScopeDef>Fixed</tt:ScopeDef>
+                  <tt:ScopeItem>onvif://www.onvif.org/type/video_encoder</tt:ScopeItem>
+                </tds:Scopes>
+                <tds:Scopes>
+                  <tt:ScopeDef>Fixed</tt:ScopeDef>
+                  <tt:ScopeItem>onvif://www.onvif.org/type/ptz</tt:ScopeItem>
+                </tds:Scopes>
+                <tds:Scopes>
+                  <tt:ScopeDef>Fixed</tt:ScopeDef>
+                  <tt:ScopeItem>onvif://www.onvif.org/hardware/V380Pro</tt:ScopeItem>
+                </tds:Scopes>
+                <tds:Scopes>
+                  <tt:ScopeDef>Configurable</tt:ScopeDef>
+                  <tt:ScopeItem>onvif://www.onvif.org/name/V380</tt:ScopeItem>
+                </tds:Scopes>
+                <tds:Scopes>
+                  <tt:ScopeDef>Configurable</tt:ScopeDef>
+                  <tt:ScopeItem>onvif://www.onvif.org/location/</tt:ScopeItem>
+                </tds:Scopes>
+              </tds:GetScopesResponse>");
+
+    private static string RespGetVideoSources() => Envelope(@"
+              <trt:GetVideoSourcesResponse>
+                <trt:VideoSources token=""VideoSource_1"">
+                  <tt:Framerate>25</tt:Framerate>
+                  <tt:Resolution>
+                    <tt:Width>1280</tt:Width>
+                    <tt:Height>720</tt:Height>
+                  </tt:Resolution>
+                  <tt:Imaging>
+                    <tt:Brightness>50</tt:Brightness>
+                    <tt:ColorSaturation>50</tt:ColorSaturation>
+                    <tt:Contrast>50</tt:Contrast>
+                    <tt:Sharpness>50</tt:Sharpness>
+                    <tt:IrCutFilter>AUTO</tt:IrCutFilter>
+                  </tt:Imaging>
+                </trt:VideoSources>
+              </trt:GetVideoSourcesResponse>");
+
+    private static string RespGetCapabilities(HttpContext ctx)
+    {
+      string host = ctx.Request.Host.ToString();
+      return Envelope($@"
+              <tds:GetCapabilitiesResponse>
+                <tds:Capabilities>
+                  <tt:Device>
+                    <tt:XAddr>http://{host}/onvif/device_service</tt:XAddr>
+                    <tt:Network>
+                      <tt:IPFilter>false</tt:IPFilter>
+                      <tt:ZeroConfiguration>false</tt:ZeroConfiguration>
+                      <tt:IPVersion6>false</tt:IPVersion6>
+                      <tt:DynDNS>false</tt:DynDNS>
+                    </tt:Network>
+                    <tt:System>
+                      <tt:DiscoveryResolve>false</tt:DiscoveryResolve>
+                      <tt:DiscoveryBye>false</tt:DiscoveryBye>
+                      <tt:RemoteDiscovery>false</tt:RemoteDiscovery>
+                      <tt:SystemBackup>false</tt:SystemBackup>
+                      <tt:SystemLogging>false</tt:SystemLogging>
+                      <tt:FirmwareUpgrade>false</tt:FirmwareUpgrade>
+                    </tt:System>
+                    <tt:IO><tt:InputConnectors>0</tt:InputConnectors><tt:RelayOutputs>0</tt:RelayOutputs></tt:IO>
+                  </tt:Device>
+                  <tt:Media>
+                    <tt:XAddr>http://{host}/onvif/media_service</tt:XAddr>
+                    <tt:StreamingCapabilities>
+                      <tt:RTPMulticast>false</tt:RTPMulticast>
+                      <tt:RTP_TCP>true</tt:RTP_TCP>
+                      <tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>
+                    </tt:StreamingCapabilities>
+                    <tt:Extension>
+                      <tt:SnapshotUri>true</tt:SnapshotUri>
+                    </tt:Extension>
+                  </tt:Media>
+                  <tt:PTZ>
+                    <tt:XAddr>http://{host}/onvif/ptz_service</tt:XAddr>
+                  </tt:PTZ>
+                  <tt:Imaging>
+                    <tt:XAddr>http://{host}/onvif/imaging_service</tt:XAddr>
+                  </tt:Imaging>
+                </tds:Capabilities>
+              </tds:GetCapabilitiesResponse>");
+    }
+
+    private static string RespGetProfiles() => Envelope($@"
+              <trt:GetProfilesResponse>
+                <trt:Profiles token=""Profile_1"" fixed=""true"">
+                  <tt:Name>V380 Live</tt:Name>
+                  <tt:VideoSourceConfiguration token=""VideoSrcCfg_1"">
+                    <tt:Name>VideoSource</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:SourceToken>VideoSource_1</tt:SourceToken>
+                    <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
+                  </tt:VideoSourceConfiguration>
+                   <tt:VideoEncoderConfiguration token=""VideoEnc_1"">
+                    <tt:Name>Encoder</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:Encoding>H264</tt:Encoding>
+                    <tt:Resolution>
+                      <tt:Width>1280</tt:Width>
+                      <tt:Height>720</tt:Height>
+                    </tt:Resolution>
+                  </tt:VideoEncoderConfiguration>
+                  <tt:PTZConfiguration token=""PTZConfig_1"">
+                    <tt:Name>PTZ</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:NodeToken>PTZNode_1</tt:NodeToken>
+                    <tt:DefaultContinuousPanTiltVelocitySpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:DefaultContinuousPanTiltVelocitySpace>
+                    <tt:DefaultRelativePanTiltTranslationSpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationGenericSpace</tt:DefaultRelativePanTiltTranslationSpace>
+                    <tt:DefaultAbsolutePantTiltPositionSpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace</tt:DefaultAbsolutePantTiltPositionSpace>
+                  </tt:PTZConfiguration>
+                </trt:Profiles>
+              </trt:GetProfilesResponse>");
+
+    // GetProfile (singular) â€” ODM calls this with a ProfileToken, expects Profile (not Profiles)
+    private static string RespGetProfile() => Envelope($@"
+              <trt:GetProfileResponse>
+                <trt:Profile token=""Profile_1"" fixed=""true"">
+                  <tt:Name>V380 Live</tt:Name>
+                  <tt:VideoSourceConfiguration token=""VideoSrcCfg_1"">
+                    <tt:Name>VideoSource</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:SourceToken>VideoSource_1</tt:SourceToken>
+                    <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
+                  </tt:VideoSourceConfiguration>
+                  <tt:VideoEncoderConfiguration token=""VideoEnc_1"">
+                    <tt:Name>H264</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:Encoding>H264</tt:Encoding>
+                    <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
+                    <tt:RateControl>
+                      <tt:FrameRateLimit>25</tt:FrameRateLimit>
+                      <tt:EncodingInterval>1</tt:EncodingInterval>
+                      <tt:BitrateLimit>4096</tt:BitrateLimit>
+                    </tt:RateControl>
+                    <tt:H264>
+                      <tt:GovLength>30</tt:GovLength>
+                      <tt:H264Profile>High</tt:H264Profile>
+                    </tt:H264>
+                    <tt:Multicast>
+                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
+                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
+                    </tt:Multicast>
+                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                  </tt:VideoEncoderConfiguration>
+                  <tt:AudioSourceConfiguration token=""AudioSrcCfg_1"">
+                    <tt:Name>AudioSource</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:SourceToken>AudioSource_1</tt:SourceToken>
+                  </tt:AudioSourceConfiguration>
+                  <tt:AudioEncoderConfiguration token=""AudioEnc_1"">
+                    <tt:Name>PCMA</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:Encoding>G711</tt:Encoding>
+                    <tt:Bitrate>64</tt:Bitrate>
+                    <tt:SampleRate>8</tt:SampleRate>
+                    <tt:Multicast>
+                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
+                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
+                    </tt:Multicast>
+                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                  </tt:AudioEncoderConfiguration>
+                  <tt:PTZConfiguration token=""PTZConfig_1"">
+                    <tt:Name>PTZ</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:NodeToken>PTZNode_1</tt:NodeToken>
+                    <tt:DefaultContinuousPanTiltVelocitySpace>
+                      http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace
+                    </tt:DefaultContinuousPanTiltVelocitySpace>
+                    <tt:DefaultPTZTimeout>PT1S</tt:DefaultPTZTimeout>
+                    <tt:PanTiltLimits>
+                      <tt:Range>
+                        <tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>
+                        <tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>
+                        <tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>
+                      </tt:Range>
+                    </tt:PanTiltLimits>
+                  </tt:PTZConfiguration>
+                </trt:Profile>
+              </trt:GetProfileResponse>");
+
+    private static string RespServiceCapabilities(HttpContext ctx)
+    {
+      string path = ctx.Request.Path.Value ?? "";
+
+      if (path.Contains("ptz"))
+        return RespPtzServiceCapabilities();
+      else if (path.Contains("media"))
+        return RespMediaServiceCapabilities();
+      else
+        return RespDeviceServiceCapabilities(); // default: device
+    }
+
+    private static string RespDeviceServiceCapabilities() => Envelope(@"
+              <tds:GetServiceCapabilitiesResponse>
+                <tds:Capabilities>
+                  <tds:Network IPFilter=""false"" ZeroConfiguration=""false"" 
+                    IPVersion6=""false"" DynDNS=""false"" 
+                    HostnameFromDHCP=""false"" NTP=""0""/>
+                  <tds:Security TLS1.0=""false"" TLS1.1=""false"" TLS1.2=""false""
+                    OnboardKeyGeneration=""false"" AccessPolicyConfig=""false""
+                    UsernameToken=""true"" HttpDigest=""false""/>
+                  <tds:System DiscoveryResolve=""false"" DiscoveryBye=""false""
+                    RemoteDiscovery=""false"" SystemBackup=""false""
+                    SystemLogging=""false"" FirmwareUpgrade=""false""/>
+                </tds:Capabilities>
+              </tds:GetServiceCapabilitiesResponse>");
+
+    private static string RespMediaServiceCapabilities() => Envelope(@"
+              <trt:GetServiceCapabilitiesResponse>
+                <trt:Capabilities SnapshotUri=""true"" Rotation=""false""
+                  VideoSourceMode=""false"" OSD=""false""/>
+              </trt:GetServiceCapabilitiesResponse>");
+
+    private static string RespPtzServiceCapabilities() => Envelope(@"
+              <tptz:GetServiceCapabilitiesResponse>
+                <tptz:Capabilities EFlip=""false"" Reverse=""false""
+                  GetCompatibleConfigurations=""false"" MoveStatus=""false""/>
+              </tptz:GetServiceCapabilitiesResponse>");
+
+    private static string RespGetNodes() => Envelope(@"
+              <tptz:GetNodesResponse>
+                <tptz:PTZNode token=""PTZNode_1"" FixedHomePosition=""false"">
+                  <tt:Name>V380 PTZ</tt:Name>
+                  <tt:SupportedPTZSpaces>
+                    <tt:ContinuousPanTiltVelocitySpace>
+                      <tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>
+                      <tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>
+                      <tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>
+                    </tt:ContinuousPanTiltVelocitySpace>
+                  </tt:SupportedPTZSpaces>
+                  <tt:MaximumNumberOfPresets>0</tt:MaximumNumberOfPresets>
+                  <tt:HomeSupported>false</tt:HomeSupported>
+                </tptz:PTZNode>
+              </tptz:GetNodesResponse>");
+
+    private static string RespGetConfigurations() => Envelope(@"
+              <tptz:GetConfigurationsResponse>
+                <tptz:PTZConfiguration token=""PTZConfig_1"">
+                  <tt:Name>PTZ</tt:Name>
+                  <tt:NodeToken>PTZNode_1</tt:NodeToken>
+                </tptz:PTZConfiguration>
+              </tptz:GetConfigurationsResponse>");
+
+    private static string RespGetConfigOptions() => Envelope(@"
+              <tptz:GetConfigurationOptionsResponse>
+                <tptz:PTZConfigurationOptions>
+                  <tt:Spaces>
+                    <tt:ContinuousPanTiltVelocitySpace>
+                      <tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>
+                      <tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>
+                      <tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>
+                    </tt:ContinuousPanTiltVelocitySpace>
+                  </tt:Spaces>
+                  <tt:PTZTimeout><tt:Min>PT0S</tt:Min><tt:Max>PT10S</tt:Max></tt:PTZTimeout>
+                </tptz:PTZConfigurationOptions>
+              </tptz:GetConfigurationOptionsResponse>");
+
+    private static string RespGetImagingSettings() => Envelope(@"
+              <timg:GetImagingSettingsResponse>
+                <timg:ImagingSettings>
+                  <tt:Brightness>50</tt:Brightness>
+                  <tt:ColorSaturation>50</tt:ColorSaturation>
+                  <tt:Contrast>50</tt:Contrast>
+                  <tt:Sharpness>50</tt:Sharpness>
+                  <tt:IrCutFilter>AUTO</tt:IrCutFilter>
+                  <tt:Exposure>
+                    <tt:Mode>AUTO</tt:Mode>
+                  </tt:Exposure>
+                  <tt:Focus>
+                    <tt:AutoFocusMode>AUTO</tt:AutoFocusMode>
+                  </tt:Focus>
+                  <tt:WideDynamicRange>
+                    <tt:Mode>OFF</tt:Mode>
+                  </tt:WideDynamicRange>
+                  <tt:WhiteBalance>
+                    <tt:Mode>AUTO</tt:Mode>
+                  </tt:WhiteBalance>
+                </timg:ImagingSettings>
+              </timg:GetImagingSettingsResponse>");
+
+    private static string RespGetStreamUri(HttpContext ctx, int rtspPort)
+    {
+      string host = ctx.Request.Host.Host.ToString();
+      return Envelope($@"
+              <trt:GetStreamUriResponse>
+                <trt:MediaUri>
+                  <tt:Uri>rtsp://{host}:{rtspPort}/live</tt:Uri>
+                  <tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>
+                  <tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>
+                  <tt:Timeout>PT0S</tt:Timeout>
+                </trt:MediaUri>
+              </trt:GetStreamUriResponse>");
+    }
+
+    private static string RespGetSnapshotUri(HttpContext ctx, int httpPort)
+    {
+      string host = ctx.Request.Host.Host.ToString();
+      return Envelope($@"
+              <trt:GetSnapshotUriResponse>
+                <trt:MediaUri>
+                  <tt:Uri>http://{host}:{httpPort}/snapshot</tt:Uri>
+                  <tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>
+                  <tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>
+                  <tt:Timeout>PT0S</tt:Timeout>
+                </trt:MediaUri>
+              </trt:GetSnapshotUriResponse>");
+    }
+
+    private static string RespGetAudioSources() => Envelope(@"
+              <trt:GetAudioSourcesResponse>
+                <trt:AudioSources token=""AudioSource_1"">
+                  <tt:Channels>1</tt:Channels>
+                </trt:AudioSources>
+              </trt:GetAudioSourcesResponse>");
+
+    private static string RespGetVideoSourceConfig() => Envelope(@"
+              <trt:GetVideoSourceConfigurationResponse>
+                <trt:VideoSourceConfiguration token=""VideoSrcCfg_1"">
+                  <tt:Name>VideoSource</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:SourceToken>VideoSource_1</tt:SourceToken>
+                  <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
+                </trt:VideoSourceConfiguration>
+              </trt:GetVideoSourceConfigurationResponse>");
+
+    private static string RespGetAudioSourceConfig() => Envelope(@"
+              <trt:GetAudioSourceConfigurationResponse>
+                <trt:AudioSourceConfiguration token=""AudioSrcCfg_1"">
+                  <tt:Name>AudioSource</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:SourceToken>AudioSource_1</tt:SourceToken>
+                </trt:AudioSourceConfiguration>
+              </trt:GetAudioSourceConfigurationResponse>");
+
+    private static string RespGetNetworkInterfaces(V380Client camera)
+    {
+      DeviceInfo info = camera.GetDeviceInfo();
+      string mac = info?.Mac ?? "00:00:00:00:00:00";
+      string ip = info?.Ip ?? NetworkHelper.GetLocalIPAddress();
+      int prefixLength = !string.IsNullOrEmpty(info?.Subnet) ? NetworkHelper.SubnetToPrefixLength(info.Subnet) : 24;
+
+      return Envelope($@"
+              <tds:GetNetworkInterfacesResponse>
+                <tds:NetworkInterfaces token=""eth0"">
+                  <tt:Enabled>true</tt:Enabled>
+                  <tt:Info>
+                    <tt:Name>eth0</tt:Name>
+                    <tt:HwAddress>{mac}</tt:HwAddress>
+                    <tt:MTU>1500</tt:MTU>
+                  </tt:Info>
+                  <tt:IPv4>
+                    <tt:Enabled>true</tt:Enabled>
+                    <tt:Config>
+                      <tt:Manual>
+                        <tt:Address>{ip}</tt:Address>
+                        <tt:PrefixLength>{prefixLength}</tt:PrefixLength>
+                      </tt:Manual>
+                      <tt:DHCP>false</tt:DHCP>
+                    </tt:Config>
+                  </tt:IPv4>
+                </tds:NetworkInterfaces>
+              </tds:GetNetworkInterfacesResponse>");
+    }
+
+    private static string RespGetDNS() => Envelope(@"
+              <tds:GetDNSResponse>
+                <tds:DNSInformation>
+                  <tt:FromDHCP>true</tt:FromDHCP>
+                </tds:DNSInformation>
+              </tds:GetDNSResponse>");
+
+    private static string RespGetNTP() => Envelope(@"
+              <tds:GetNTPResponse>
+                <tds:NTPInformation>
+                  <tt:FromDHCP>false</tt:FromDHCP>
+                </tds:NTPInformation>
+              </tds:GetNTPResponse>");
+
+    private static string RespGetHostname() => Envelope(@"
+              <tds:GetHostnameResponse>
+                <tds:HostnameInformation>
+                  <tt:FromDHCP>false</tt:FromDHCP>
+                  <tt:Name>V380Pro</tt:Name>
+                </tds:HostnameInformation>
+              </tds:GetHostnameResponse>");
+
+    private static string RespGetStatus() => Envelope($@"
+              <tptz:GetStatusResponse>
+                <tptz:PTZStatus>
+                  <tt:Position>
+                    <tt:PanTilt x=""0"" y=""0""
+                      space=""http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace""/>
+                    <tt:Zoom x=""0""
+                      space=""http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace""/>
+                  </tt:Position>
+                  <tt:MoveStatus>
+                    <tt:PanTilt>IDLE</tt:PanTilt>
+                    <tt:Zoom>IDLE</tt:Zoom>
+                  </tt:MoveStatus>
+                  <tt:UtcTime>{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ}</tt:UtcTime>
+                </tptz:PTZStatus>
+              </tptz:GetStatusResponse>");
+
+    private static string RespGetPresets() => Envelope(@"
+              <tptz:GetPresetsResponse>
+              </tptz:GetPresetsResponse>");
+
+    private static string RespGetMoveOptions() => Envelope(@"
+              <timg:GetMoveOptionsResponse>
+                <timg:MoveOptions>
+                  <tt:Focus>
+                    <tt:Continuous><tt:Speed><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:Speed></tt:Continuous>
+                  </tt:Focus>
+                </timg:MoveOptions>
+              </timg:GetMoveOptionsResponse>");
+
+    private static string RespGetImagingOptions() => Envelope(@"
+              <timg:GetOptionsResponse>
+                <timg:ImagingOptions>
+                  <tt:Brightness><tt:Min>0</tt:Min><tt:Max>100</tt:Max></tt:Brightness>
+                  <tt:ColorSaturation><tt:Min>0</tt:Min><tt:Max>100</tt:Max></tt:ColorSaturation>
+                  <tt:Contrast><tt:Min>0</tt:Min><tt:Max>100</tt:Max></tt:Contrast>
+                  <tt:Sharpness><tt:Min>0</tt:Min><tt:Max>100</tt:Max></tt:Sharpness>
+                  <tt:IrCutFilterModes>ON</tt:IrCutFilterModes>
+                  <tt:IrCutFilterModes>OFF</tt:IrCutFilterModes>
+                  <tt:IrCutFilterModes>AUTO</tt:IrCutFilterModes>
+                  <tt:WhiteBalanceModes>AUTO</tt:WhiteBalanceModes>
+                  <tt:WhiteBalanceModes>AUTO</tt:WhiteBalanceModes>
+                  <tt:IrCutFilterModes>AUTO</tt:IrCutFilterModes>
+                </timg:ImagingOptions>
+              </timg:GetOptionsResponse>");
+
+    private static string RespGetVideoSourceConfigurations() => Envelope(@"
+              <trt:GetVideoSourceConfigurationsResponse>
+                <trt:Configurations token=""VideoSrcCfg_1"">
+                  <tt:Name>VideoSource</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:SourceToken>VideoSource_1</tt:SourceToken>
+                  <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
+                </trt:Configurations>
+              </trt:GetVideoSourceConfigurationsResponse>");
+
+    private static string RespGetVideoEncoderConfigurations() => Envelope(@"
+              <trt:GetVideoEncoderConfigurationsResponse>
+                <trt:Configurations token=""VideoEnc_1"">
+                  <tt:Name>H264</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:Encoding>H264</tt:Encoding>
+                  <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
+                  <tt:RateControl>
+                    <tt:FrameRateLimit>25</tt:FrameRateLimit>
+                    <tt:EncodingInterval>1</tt:EncodingInterval>
+                    <tt:BitrateLimit>4096</tt:BitrateLimit>
+                  </tt:RateControl>
+                  <tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>
+                  <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                </trt:Configurations>
+              </trt:GetVideoEncoderConfigurationsResponse>");
+
+    private static string RespGetVideoEncoderConfig() => Envelope(@"
+              <trt:GetVideoEncoderConfigurationResponse>
+                <trt:Configuration token=""VideoEnc_1"">
+                  <tt:Name>H264</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:Encoding>H264</tt:Encoding>
+                  <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
+                  <tt:RateControl>
+                    <tt:FrameRateLimit>25</tt:FrameRateLimit>
+                    <tt:EncodingInterval>1</tt:EncodingInterval>
+                    <tt:BitrateLimit>4096</tt:BitrateLimit>
+                  </tt:RateControl>
+                  <tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>
+                  <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                </trt:Configuration>
+              </trt:GetVideoEncoderConfigurationResponse>");
+
+    private static string RespGetAudioSourceConfigurations() => Envelope(@"
+              <trt:GetAudioSourceConfigurationsResponse>
+                <trt:Configurations token=""AudioSrcCfg_1"">
+                  <tt:Name>AudioSource</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:SourceToken>AudioSource_1</tt:SourceToken>
+                </trt:Configurations>
+              </trt:GetAudioSourceConfigurationsResponse>");
+
+    private static string RespGetAudioEncoderConfigurations() => Envelope(@"
+              <trt:GetAudioEncoderConfigurationsResponse>
+                <trt:Configurations token=""AudioEnc_1"">
+                  <tt:Name>G711</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:Encoding>G711</tt:Encoding>
+                  <tt:Bitrate>64</tt:Bitrate>
+                  <tt:SampleRate>8</tt:SampleRate>
+                  <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                </trt:Configurations>
+              </trt:GetAudioEncoderConfigurationsResponse>");
+
+    private static string RespGetAudioEncoderConfig() => Envelope(@"
+              <trt:GetAudioEncoderConfigurationResponse>
+                <trt:Configuration token=""AudioEnc_1"">
+                  <tt:Name>G711</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:Encoding>G711</tt:Encoding>
+                  <tt:Bitrate>64</tt:Bitrate>
+                  <tt:SampleRate>8</tt:SampleRate>
+                  <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                </trt:Configuration>
+              </trt:GetAudioEncoderConfigurationResponse>");
+
+    private static string RespGetVideoEncoderConfigOptions() => Envelope(@"
+              <trt:GetVideoEncoderConfigurationOptionsResponse>
+                <trt:Options>
+                  <tt:QualityRange><tt:Min>0</tt:Min><tt:Max>100</tt:Max></tt:QualityRange>
+                  <tt:H264>
+                    <tt:ResolutionsAvailable>
+                      <tt:Width>1920</tt:Width><tt:Height>1080</tt:Height>
+                    </tt:ResolutionsAvailable>
+                    <tt:ResolutionsAvailable>
+                      <tt:Width>1280</tt:Width><tt:Height>720</tt:Height>
+                    </tt:ResolutionsAvailable>
+                    <tt:ResolutionsAvailable>
+                      <tt:Width>640</tt:Width><tt:Height>480</tt:Height>
+                    </tt:ResolutionsAvailable>
+                    <tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>255</tt:Max></tt:GovLengthRange>
+                    <tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>30</tt:Max></tt:FrameRateRange>
+                    <tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>1</tt:Max></tt:EncodingIntervalRange>
+                    <tt:H264ProfilesSupported>Baseline</tt:H264ProfilesSupported>
+                    <tt:H264ProfilesSupported>Main</tt:H264ProfilesSupported>
+                    <tt:H264ProfilesSupported>High</tt:H264ProfilesSupported>
+                  </tt:H264>
+                  <tt:Extension>
+                    <tt:H264>
+                      <tt:BitrateRange><tt:Min>128</tt:Min><tt:Max>8192</tt:Max></tt:BitrateRange>
+                    </tt:H264>
+                  </tt:Extension>
+                </trt:Options>
+              </trt:GetVideoEncoderConfigurationOptionsResponse>");
+
+    private static string RespGetAudioEncoderConfigOptions() => Envelope(@"
+              <trt:GetAudioEncoderConfigurationOptionsResponse>
+                <trt:Options>
+                  <tt:Options>
+                    <tt:Encoding>G711</tt:Encoding>
+                    <tt:BitrateList>64</tt:BitrateList>
+                    <tt:SampleRateList>8</tt:SampleRateList>
+                  </tt:Options>
+                  <tt:Options>
+                    <tt:Encoding>PCMU</tt:Encoding>
+                    <tt:BitrateList>64</tt:BitrateList>
+                    <tt:SampleRateList>8</tt:SampleRateList>
+                  </tt:Options>
+                </trt:Options>
+              </trt:GetAudioEncoderConfigurationOptionsResponse>");
+    private static string RespGetGetNetworkProtocols(int httpPort, int rtspPort) => Envelope($@"
+            <tds:GetNetworkProtocolsResponse>
+              <tds:NetworkProtocols>
+                <tt:Name>HTTP</tt:Name>
+                <tt:Enabled>true</tt:Enabled>
+                <tt:Port>{httpPort}</tt:Port>
+              </tds:NetworkProtocols>
+              <tds:NetworkProtocols>
+                <tt:Name>RTSP</tt:Name>
+                <tt:Enabled>true</tt:Enabled>
+                <tt:Port>{rtspPort}</tt:Port>
+              </tds:NetworkProtocols>
+
+            </tds:GetNetworkProtocolsResponse>");
+    private static string RespGetNetworkDefaultGateway(V380Client camera)
+    {
+      DeviceInfo info = camera.GetDeviceInfo();
+      string gateway = info?.Gateway ?? "0.0.0.0";
+      return Envelope($@"
+            <tds:GetNetworkDefaultGatewayResponse>
+              <tds:NetworkGateway>
+              <tt:IPv4Address>{gateway}</tt:IPv4Address>
+              </tds:NetworkGateway>
+            </tds:GetNetworkDefaultGatewayResponse>");
+    }
+
+    private static string RespGetDiscoveryMode() => Envelope($@"
+            <tds:GetDiscoveryModeResponse>
+              <tds:DiscoveryMode>Discoverable</tds:DiscoveryMode>
+            </tds:GetDiscoveryModeResponse>");
+    private static string SoapOk(string action)
+    {
+      string ns = (action.Contains("Move") || action.Contains("Stop") || action.Contains("Home") || action.Contains("Preset")) ? "tptz" : "trt";
+      return Envelope($"<{ns}:{action}Response/>");
+    }
+
+    private static string SoapFault(string code, string detail) => Envelope($@"
+              <s:Fault>
+                <s:Code><s:Value>s:{code}</s:Value></s:Code>
+                <s:Reason><s:Text>{System.Security.SecurityElement.Escape(detail)}</s:Text></s:Reason>
+              </s:Fault>");
+
+    private static string Envelope(string body) =>
+        $@"<?xml version=""1.0"" encoding=""UTF-8""?>
+            <s:Envelope xmlns:s=""http://www.w3.org/2003/05/soap-envelope""
+                        xmlns:tt=""http://www.onvif.org/ver10/schema""
+                        xmlns:tds=""http://www.onvif.org/ver10/device/wsdl""
+                        xmlns:trt=""http://www.onvif.org/ver10/media/wsdl""
+                        xmlns:tptz=""http://www.onvif.org/ver10/ptz/wsdl""
+                        xmlns:timg=""http://www.onvif.org/ver20/imaging/wsdl"">
+            <s:Body>{body}
+            </s:Body>
+            </s:Envelope>";
+
+    static bool Contains(string action, string body, string keyword)
+    {
+      bool match = action.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+       body.Contains(keyword, StringComparison.OrdinalIgnoreCase);
+      if (match) LogUtils.debug($"[ONVIF] request: {keyword}");
+      return match;
+    }
+
+    static float ParseFloat(string body, string tag, float def = 0f)
+    {
+      // match  tag="value"  or  <tag>value</tag>
+      var m = System.Text.RegularExpressions.Regex.Match(
+          body, $@"{tag}=""([^""]+)""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+      if (!m.Success)
+        m = System.Text.RegularExpressions.Regex.Match(
+            body, $@"<[^>]*{tag}[^>]*>([^<]+)<", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+      return m.Success && float.TryParse(m.Groups[1].Value,
+          System.Globalization.NumberStyles.Float,
+          System.Globalization.CultureInfo.InvariantCulture, out float v) ? v : def;
+    }
+
+    static string ParseTag(string body, string tag)
+    {
+      var m = System.Text.RegularExpressions.Regex.Match(
+          body, $@"<[^>]*{tag}[^>]*>([^<]*)<", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+      return m.Success ? m.Groups[1].Value.Trim() : "";
+    }
+  }
+}
+
+========== C:\c\V380Decoder\src\RtspServer.cs ==========
+
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+
+namespace V380Decoder.src
+{
+    public class RtspServer
+    {
+        private readonly int port;
+        private readonly bool secure;
+        private readonly string username;
+        private readonly string password;
+        private TcpListener listener;
+        private Thread acceptThread;
+        private volatile bool running;
+
+        // concurrent set of active sessions
+        private readonly ConcurrentDictionary<int, RtspSession> sessions = new();
+        private int nextId;
+
+        // SPS/PPS from first keyframe â€“ used for SDP fmtp line (H.264)
+        private byte[] cachedSps, cachedPps;
+        // VPS/SPS/PPS for H.265
+        private byte[] cacheVps, cacheH265Sps, cacheH265Pps;
+        // detected codec: false=H.264, true=H.265
+        private bool isH265 = false;
+        private readonly object sdpLock = new();
+
+        public RtspServer(int port, bool secure, string username, string password)
+        {
+            this.port = port;
+            this.username = username;
+            this.password = password;
+            this.secure = secure;
+        }
+
+        public bool IsSecure => secure;
+        public string Username => username;
+        public string Password => password;
+
+        public void Start()
+        {
+            string basicAuth = secure ? $"{username}:{password}@" : string.Empty;
+            listener = new TcpListener(IPAddress.Any, port);
+            listener.Start(10);
+            running = true;
+            acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "rtsp-accept" };
+            acceptThread.Start();
+            Console.Error.WriteLine($"[RTSP] rtsp://{basicAuth}{NetworkHelper.GetLocalIPAddress()}:{port}/live");
+        }
+
+        void AcceptLoop()
+        {
+            while (running)
+            {
+                try
+                {
+                    var tcp = listener.AcceptTcpClient();
+                    tcp.NoDelay = true;
+                    int id = Interlocked.Increment(ref nextId);
+                    var s = new RtspSession(id, tcp, this, secure);
+                    sessions[id] = s;
+                    s.Start();
+                    s.OnClose += () => sessions.TryRemove(id, out _);
+                }
+                catch { }
+            }
+        }
+
+        // Called from main receive loop for every complete video frame
+        public void PushVideo(FrameData f)
+        {
+            if (f.RawType == 0x28 || f.RawType == 0x29)
+            {
+                // H.265 frames: cache VPS/SPS/PPS from first keyframe
+                if (f.RawType == 0x28) CacheH265Params(f.Payload);
+            }
+            else
+            {
+                if (f.IsKeyframe) CacheSpsFromIdr(f.Payload);
+            }
+            foreach (var s in sessions.Values) s.PushVideo(f);
+        }
+
+        // Called from main receive loop for every complete audio frame
+        public void PushAudio(FrameData f)
+        {
+            foreach (var s in sessions.Values) s.PushAudio(f);
+        }
+
+        // â”€â”€ H.264 SPS/PPS extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        void CacheSpsFromIdr(byte[] data)
+        {
+            lock (sdpLock)
+            {
+                if (cachedSps != null && cachedPps != null) return; // already cached
+                ParseNals(data, (nalType, nal) =>
+                {
+                    if (nalType == 7 && cachedSps == null) cachedSps = nal;
+                    if (nalType == 8 && cachedPps == null) cachedPps = nal;
+                });
+            }
+        }
+
+        // â”€â”€ H.265 VPS/SPS/PPS extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        void CacheH265Params(byte[] data)
+        {
+            lock (sdpLock)
+            {
+                if (cacheVps != null && cacheH265Sps != null && cacheH265Pps != null) return;
+                isH265 = true;
+                int i = 0, len = data.Length;
+                while (i < len)
+                {
+                    int sc = FindStartCode(data, i);
+                    if (sc < 0) break;
+                    int scLen = (sc + 3 < len && data[sc + 2] == 1) ? 3 : 4;
+                    int nalStart = sc + scLen;
+                    if (nalStart >= len) break;
+                    int next = FindStartCode(data, nalStart);
+                    int nalEnd = next < 0 ? len : next;
+                    if (nalStart + 1 >= nalEnd) { i = nalEnd; continue; }
+                    int nalType = (data[nalStart] >> 1) & 0x3F; // H.265 NAL type
+                    var nal = new byte[nalEnd - nalStart];
+                    Array.Copy(data, nalStart, nal, 0, nal.Length);
+                    if (nalType == 32 && cacheVps == null) cacheVps = nal;      // VPS
+                    else if (nalType == 33 && cacheH265Sps == null) cacheH265Sps = nal; // SPS
+                    else if (nalType == 34 && cacheH265Pps == null) cacheH265Pps = nal; // PPS
+                    i = nalEnd;
+                }
+            }
+        }
+
+        public bool IsH265 => isH265;
+
+        // Walk H.264 Annex-B start codes, call cb(nalType, nalBytes) for each NAL
+        internal static void ParseNals(byte[] data, Action<int, byte[]> cb)
+        {
+            int i = 0, len = data.Length;
+            while (i < len)
+            {
+                // find start code
+                int sc = FindStartCode(data, i);
+                if (sc < 0) break;
+                int scLen = (sc + 3 < len && data[sc + 2] == 1) ? 3 : 4;
+                int nalStart = sc + scLen;
+                if (nalStart >= len) break;
+                // find next start code
+                int next = FindStartCode(data, nalStart);
+                int nalEnd = next < 0 ? len : next;
+                int nalType = data[nalStart] & 0x1F;
+                var nal = new byte[nalEnd - nalStart];
+                Array.Copy(data, nalStart, nal, 0, nal.Length);
+                cb(nalType, nal);
+                i = nalEnd;
+            }
+        }
+
+        internal static void ParseNalsH265(byte[] data, Action<int, byte[]> cb)
+        {
+            int i = 0, len = data.Length;
+            while (i < len)
+            {
+                int sc = FindStartCode(data, i);
+                if (sc < 0) break;
+                int scLen = (sc + 3 < len && data[sc + 2] == 1) ? 3 : 4;
+                int nalStart = sc + scLen;
+                if (nalStart >= len) break;
+                int next = FindStartCode(data, nalStart);
+                int nalEnd = next < 0 ? len : next;
+                if (nalStart + 1 >= nalEnd) { i = nalEnd; continue; }
+                int nalType = (data[nalStart] >> 1) & 0x3F; // H.265 NAL type
+                var nal = new byte[nalEnd - nalStart];
+                Array.Copy(data, nalStart, nal, 0, nal.Length);
+                cb(nalType, nal);
+                i = nalEnd;
+            }
+        }
+
+        static int FindStartCode(byte[] d, int from)
+        {
+            for (int i = from; i + 3 < d.Length; i++)
+            {
+                if (d[i] == 0 && d[i + 1] == 0)
+                {
+                    if (d[i + 2] == 1) return i;
+                    if (d[i + 2] == 0 && i + 3 < d.Length && d[i + 3] == 1) return i;
+                }
+            }
+            return -1;
+        }
+
+        public string BuildSdp()
+        {
+            lock (sdpLock)
+            {
+                if (isH265 && cacheVps != null && cacheH265Sps != null && cacheH265Pps != null)
+                {
+                    string vpsB64 = Convert.ToBase64String(cacheVps);
+                    string spsB64 = Convert.ToBase64String(cacheH265Sps);
+                    string ppsB64 = Convert.ToBase64String(cacheH265Pps);
+                    return
+                        "v=0\r\n" +
+                        "o=- 1 1 IN IP4 0.0.0.0\r\n" +
+                        "s=V380 Live\r\n" +
+                        "t=0 0\r\n" +
+                        "a=recvonly\r\n" +
+                        "m=video 0 RTP/AVP 96\r\n" +
+                        "a=rtpmap:96 H265/90000\r\n" +
+                        $"a=fmtp:96 packetization-mode=1;sprop-vps={vpsB64};sprop-sps={spsB64};sprop-pps={ppsB64}\r\n" +
+                        "a=control:trackID=0\r\n" +
+                        "m=audio 0 RTP/AVP 8\r\n" +
+                        "a=rtpmap:8 PCMA/8000/1\r\n" +
+                        "a=control:trackID=1\r\n";
+                }
+
+                string fmtp = "";
+                if (cachedSps != null && cachedPps != null)
+                {
+                    string spsB64 = Convert.ToBase64String(cachedSps);
+                    string ppsB64 = Convert.ToBase64String(cachedPps);
+                    string pli = cachedSps.Length >= 4
+                        ? $"{cachedSps[1]:X2}{cachedSps[2]:X2}{cachedSps[3]:X2}"
+                        : "64001F";
+                    fmtp = $"a=fmtp:96 packetization-mode=1;sprop-parameter-sets={spsB64},{ppsB64};profile-level-id={pli}\r\n";
+                }
+                return
+                    "v=0\r\n" +
+                    "o=- 1 1 IN IP4 0.0.0.0\r\n" +
+                    "s=V380 Live\r\n" +
+                    "t=0 0\r\n" +
+                    "a=recvonly\r\n" +
+                    "m=video 0 RTP/AVP 96\r\n" +
+                    "a=rtpmap:96 H264/90000\r\n" +
+                    fmtp +
+                    "a=control:trackID=0\r\n" +
+                    "m=audio 0 RTP/AVP 8\r\n" +
+                    "a=rtpmap:8 PCMA/8000/1\r\n" +
+                    "a=control:trackID=1\r\n";
+            }
+        }
+
+        public void Dispose()
+        {
+            running = false;
+            try { listener?.Stop(); } catch { }
+            foreach (var s in sessions.Values) s.Close();
+        }
+    }
+}
+
+
+========== C:\c\V380Decoder\src\RtspSession.cs ==========
+
+using System.Net.Sockets;
+using System.Text;
+
+namespace V380Decoder.src
+{
+    public class RtspSession
+    {
+        private readonly int id;
+        private readonly TcpClient tcp;
+        private readonly NetworkStream ns;
+        private readonly RtspServer server;
+        private readonly bool secure;
+        private bool authenticated;
+        private Thread readThread;
+        private volatile bool playing;
+        private volatile bool alive = true;
+
+        // interleaved channels negotiated in SETUP
+        private byte videoCh = 0, audioCh = 2;
+
+        // RTP state
+        private ushort videoSeq, audioSeq;
+        private uint videoSsrc = (uint)new Random().Next();
+        private uint audioSsrc = (uint)new Random().Next();
+
+        // Monotonically increasing synthetic RTP timestamps
+        private uint _videoRtsClock = 0;
+        private const uint RTP_VIDEO_TICK = 7500;  // ~12 fps at 90 kHz clock
+        private uint _audioRtsClock = 0;
+
+        public event Action OnClose;
+
+        public RtspSession(int id, TcpClient tcp, RtspServer server, bool secure = false)
+        {
+            this.id = id; this.tcp = tcp; this.server = server;
+            this.secure = secure;
+            this.authenticated = !secure; // if not secure, auto-authenticate
+            ns = tcp.GetStream();
+        }
+
+        public void Start()
+        {
+            readThread = new Thread(ReadLoop) { IsBackground = true, Name = $"rtsp-{id}" };
+            readThread.Start();
+        }
+
+        public void Close()
+        {
+            alive = false;
+            playing = false;
+            try { tcp.Close(); } catch { }
+            OnClose?.Invoke();
+        }
+
+        // â”€â”€ RTSP request reader â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        void ReadLoop()
+        {
+            var sb = new StringBuilder();
+            var buf = new byte[4096];
+            try
+            {
+                while (alive)
+                {
+                    int n = ns.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+                    string raw = sb.ToString();
+                    int end;
+                    while ((end = raw.IndexOf("\r\n\r\n", StringComparison.Ordinal)) >= 0)
+                    {
+                        string req = raw[..(end + 4)];
+                        raw = raw[(end + 4)..];
+                        HandleRequest(req);
+                    }
+                    sb.Clear(); sb.Append(raw);
+                }
+            }
+            catch { }
+            finally { Close(); }
+        }
+
+        // â”€â”€ Authentication â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        private bool CheckAuth(string authHeader)
+        {
+            if (string.IsNullOrEmpty(authHeader)) return false;
+
+            var headerParts = authHeader.Split(':', 2);
+            if (headerParts.Length != 2) return false;
+
+            string authValue = headerParts[1].Trim();
+            if (!authValue.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            try
+            {
+                string encoded = authValue["Basic ".Length..].Trim();
+                string credential = Encoding.ASCII.GetString(Convert.FromBase64String(encoded));
+                var parts = credential.Split(':', 2);
+
+                if (parts.Length == 2 &&
+                    parts[0] == server.Username &&
+                    parts[1] == server.Password)
+                {
+                    return true;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        void HandleRequest(string req)
+        {
+            string[] lines = req.Split("\r\n", StringSplitOptions.None);
+            if (lines.Length == 0) return;
+
+            string method = lines[0].Split(' ')[0];
+            string url = lines[0].Split(' ').ElementAtOrDefault(1) ?? "";
+            string cseq = lines.FirstOrDefault(l => l.StartsWith("CSeq:", StringComparison.OrdinalIgnoreCase))
+                                  ?.Split(':', 2)[1].Trim() ?? "0";
+            string transport = lines.FirstOrDefault(l => l.StartsWith("Transport:", StringComparison.OrdinalIgnoreCase)) ?? "";
+            string authHeader = lines.FirstOrDefault(l => l.StartsWith("Authorization:", StringComparison.OrdinalIgnoreCase)) ?? "";
+
+            // Check authentication for methods other than OPTIONS (if secure)
+            if (secure && method != "OPTIONS" && !authenticated)
+            {
+                if (!CheckAuth(authHeader))
+                {
+                    Send($"RTSP/1.0 401 Unauthorized\r\nCSeq: {cseq}\r\n" +
+                         $"WWW-Authenticate: Basic realm=\"V380 Authentication\"\r\n\r\n");
+                    return;
+                }
+                authenticated = true;
+            }
+
+            switch (method)
+            {
+                case "OPTIONS":
+                    Reply(cseq, "Public: OPTIONS,DESCRIBE,SETUP,PLAY,TEARDOWN");
+                    break;
+
+                case "DESCRIBE":
+                    {
+                        string sdp = server.BuildSdp();
+                        byte[] body = Encoding.ASCII.GetBytes(sdp);
+                        Send($"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n" +
+                             $"Content-Type: application/sdp\r\nContent-Length: {body.Length}\r\n\r\n{sdp}");
+                        break;
+                    }
+
+                case "SETUP":
+                    {
+                        bool isAudio = url.Contains("trackID=1");
+                        byte ch = (byte)(isAudio ? 2 : 0);
+                        var m = System.Text.RegularExpressions.Regex.Match(transport, @"interleaved=(\d+)-(\d+)");
+                        if (m.Success) ch = byte.Parse(m.Groups[1].Value);
+
+                        if (isAudio) audioCh = ch;
+                        else videoCh = ch;
+
+                        Reply(cseq,
+                            $"Transport: RTP/AVP/TCP;unicast;interleaved={ch}-{ch + 1}",
+                            "Session: 1");
+                        break;
+                    }
+
+                case "PLAY":
+                    Reply(cseq,
+                        "Session: 1",
+                        $"RTP-Info: url={url}/trackID=0;seq={videoSeq},url={url}/trackID=1;seq={audioSeq}");
+                    playing = true;
+                    Console.Error.WriteLine($"[RTSP#{id}] playing");
+                    break;
+
+                case "TEARDOWN":
+                    Reply(cseq, "Session: 1");
+                    Close();
+                    break;
+
+                default:
+                    Send($"RTSP/1.0 501 Not Implemented\r\nCSeq: {cseq}\r\n\r\n");
+                    break;
+            }
+        }
+
+        void Reply(string cseq, params string[] headers)
+        {
+            var sb = new StringBuilder();
+            sb.Append($"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n");
+            foreach (var h in headers) sb.Append(h + "\r\n");
+            sb.Append("\r\n");
+            Send(sb.ToString());
+        }
+
+        void Send(string s)
+        {
+            try
+            {
+                byte[] b = Encoding.ASCII.GetBytes(s);
+                lock (ns) { ns.Write(b, 0, b.Length); ns.Flush(); }
+            }
+            catch { alive = false; }
+        }
+
+        // â”€â”€ RTP video push  (H.264/H.265 Annex-B â†’ RTP NAL/FU-A) â”€â”€â”€â”€â”€â”€
+        public void PushVideo(FrameData f)
+        {
+            if (!playing) return;
+
+            // Use synthetic monotonically increasing RTP timestamps
+            // Camera timestamps are unreliable and cause non-monotonic DTS errors
+            _videoRtsClock += RTP_VIDEO_TICK;
+
+            if (server.IsH265)
+            {
+                PushVideoH265(f.Payload, _videoRtsClock);
+                return;
+            }
+
+            uint rts = _videoRtsClock;
+            RtspServer.ParseNals(f.Payload, (nalType, nal) =>
+            {
+                const int MTU = 1400;
+                if (nal.Length <= MTU)
+                {
+                    // Single NAL unit packet
+                    SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, nal, 0, nal.Length, marker: true);
+                }
+                else
+                {
+                    // FU-A fragmentation
+                    byte nalHdr = nal[0];
+                    byte fuInd = (byte)((nalHdr & 0xE0) | 28); // NRI from original, type=28
+                    int offset = 1; // skip original NAL header
+                    bool first = true;
+
+                    while (offset < nal.Length)
+                    {
+                        int chunk = Math.Min(MTU - 2, nal.Length - offset);
+                        bool last = offset + chunk >= nal.Length;
+
+                        byte fuHdr = (byte)(nalHdr & 0x1F);              // NAL type
+                        if (first) fuHdr |= 0x80;                        // S bit
+                        if (last) fuHdr |= 0x40;                        // E bit
+
+                        var frag = new byte[2 + chunk];
+                        frag[0] = fuInd;
+                        frag[1] = fuHdr;
+                        Array.Copy(nal, offset, frag, 2, chunk);
+
+                        SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc,
+                                frag, 0, frag.Length, marker: last);
+                        offset += chunk;
+                        first = false;
+                    }
+                }
+            });
+        }
+
+        // â”€â”€ H.265 RTP push â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        void PushVideoH265(byte[] data, uint rts)
+        {
+            RtspServer.ParseNalsH265(data, (nalType, nal) =>
+            {
+                const int MTU = 1400;
+                // Non-VCL NAL types (32+): VPS, SPS, PPS, AUD, etc. â€” send as single units
+                if (nalType >= 32)
+                {
+                    if (nal.Length <= MTU)
+                    {
+                        SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, nal, 0, nal.Length, marker: false);
+                    }
+                    return;
+                }
+
+                if (nal.Length <= MTU)
+                {
+                    // Single NAL unit packet
+                    SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, nal, 0, nal.Length, marker: true);
+                }
+                else
+                {
+                    // H.265 FU (Fragmentation Unit) - type 49
+                    byte nalHdr0 = nal[0];
+                    byte nalHdr1 = nal.Length > 1 ? nal[1] : (byte)0;
+                    byte fuIndicator = (byte)((nalHdr0 & 0x81) | (49 << 1)); // type=49 FU
+                    int offset = 2; // 2-byte H.265 NAL header
+                    bool first = true;
+
+                    while (offset < nal.Length)
+                    {
+                        int chunk = Math.Min(MTU - 3, nal.Length - offset);
+                        bool last = offset + chunk >= nal.Length;
+
+                        // FU header byte
+                        byte fuHdr = (byte)(nalType & 0x3F);
+                        if (first) fuHdr |= 0x80; // S bit
+                        if (last) fuHdr |= 0x40;  // E bit
+
+                        var frag = new byte[3 + chunk];
+                        frag[0] = fuIndicator;
+                        frag[1] = nalHdr1; // keep second header byte
+                        frag[2] = fuHdr;
+                        Array.Copy(nal, offset, frag, 3, chunk);
+
+                        SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc,
+                                frag, 0, frag.Length, marker: last);
+                        offset += chunk;
+                        first = false;
+                    }
+                }
+            });
+        }
+
+        // â”€â”€ RTP audio push  (PCMA raw samples) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        public void PushAudio(FrameData f)
+        {
+            if (!playing) return;
+
+            // Use synthetic RTP timestamps to prevent DTS discontinuities
+            // 160 samples per chunk at 8 kHz = 20 ms of audio per RTP packet
+            const int CHUNK = 160;
+            for (int off = 0; off < f.Payload.Length; off += CHUNK)
+            {
+                int len = Math.Min(CHUNK, f.Payload.Length - off);
+                SendRtp(audioCh, 8, audioSeq++, _audioRtsClock, audioSsrc,
+                        f.Payload, off, len, marker: false);
+                _audioRtsClock += (uint)CHUNK;
+            }
+        }
+
+        void SendRtp(byte channel, byte pt, ushort seq, uint ts, uint ssrc,
+                     byte[] payload, int offset, int length, bool marker)
+        {
+            int rtpLen = 12 + length;
+            var frame = new byte[4 + rtpLen];
+
+            frame[0] = 0x24; // '$'
+            frame[1] = channel;
+            frame[2] = (byte)(rtpLen >> 8);
+            frame[3] = (byte)rtpLen;
+
+            frame[4] = 0x80;
+            frame[5] = (byte)((marker ? 0x80 : 0) | (pt & 0x7F));
+            frame[6] = (byte)(seq >> 8);
+            frame[7] = (byte)seq;
+            frame[8] = (byte)(ts >> 24);
+            frame[9] = (byte)(ts >> 16);
+            frame[10] = (byte)(ts >> 8);
+            frame[11] = (byte)ts;
+            frame[12] = (byte)(ssrc >> 24);
+            frame[13] = (byte)(ssrc >> 16);
+            frame[14] = (byte)(ssrc >> 8);
+            frame[15] = (byte)ssrc;
+
+            Array.Copy(payload, offset, frame, 16, length);
+
+            try
+            {
+                lock (ns) { ns.Write(frame, 0, frame.Length); }
+            }
+            catch { alive = false; }
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\SnapshotManager.cs ==========
+
+using System.Diagnostics;
+using H264Sharp;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.PixelFormats;
+
+namespace V380Decoder.src
+{
+    public class SnapshotManager : IDisposable
+    {
+        // â”€â”€ shared state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        private readonly object _lock = new();
+        private byte[] _cachedJpeg = null;
+        private int _width, _height;
+
+        // â”€â”€ mjpeg subscribers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        private readonly List<Action<byte[]>> _subscribers = new();
+        private readonly object _subLock = new();
+        private readonly object _ffmpegLock = new();
+
+        // â”€â”€ decode pipeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        private readonly bool _useFFmpeg;
+        private readonly CancellationTokenSource _cts = new();
+
+        // H264Sharp path
+        private H264Decoder _decoder;
+        private bool _decoderReady = false;
+
+        // FFmpeg path
+        private Process _ffmpegProc;
+        private Stream _ffmpegStdin;
+
+        // Frame queue 
+        private readonly System.Threading.Channels.Channel<(byte[] data, bool isIFrame)> _queue =
+        System.Threading.Channels.Channel.CreateBounded<(byte[], bool)>(
+        new System.Threading.Channels.BoundedChannelOptions(30)
+        {
+            FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest,
+            SingleReader = true
+        });
+
+        // SPS/PPS for prepend to I-frame (H264Sharp path)
+        private byte[] _sps, _pps;
+
+        private bool _mjpegActive = false;
+        private byte[] _lastIFrame = null;
+        private readonly SemaphoreSlim _snapshotSem = new(1, 1);
+
+        public SnapshotManager()
+        {
+            _useFFmpeg = IsFFmpegAvailable();
+            LogUtils.debug($"[SNAP] decoder={(_useFFmpeg ? "FFmpeg" : "H264Sharp")}");
+
+            if (_useFFmpeg)
+                StartFFmpegPipe();
+            else
+                _decoder = new H264Decoder();
+
+            Task.Run(() => DecodeLoop(_cts.Token));
+        }
+
+        // â”€â”€ public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        public void SetMjpegActive(bool active)
+        {
+            _mjpegActive = active;
+            LogUtils.debug($"[SNAP] MJPEG {(active ? "enable" : "disabled")}");
+        }
+
+        public void UpdateFrame(byte[] h264Frame, int width, int height, bool isIFrame)
+        {
+            lock (_lock)
+            {
+                _width = width;
+                _height = height;
+            }
+
+            if (isIFrame)
+            {
+                ExtractSpsAndPps(h264Frame);
+                lock (_lock) { _lastIFrame = (byte[])h264Frame.Clone(); }
+            }
+
+            if (!_mjpegActive) return;
+
+            if (_useFFmpeg)
+            {
+                try
+                {
+                    // Write asynchronously so we never block the camera receive loop
+                    Task.Run(() =>
+                    {
+                        lock (_ffmpegLock)
+                        {
+                            _ffmpegStdin?.Write(h264Frame, 0, h264Frame.Length);
+                            _ffmpegStdin?.Flush();
+                        }
+                    });
+                }
+                catch (Exception ex) { LogUtils.debug($"[SNAP] FFmpeg write error: {ex.Message}"); }
+            }
+            else
+            {
+                _queue.Writer.TryWrite(((byte[])h264Frame.Clone(), isIFrame));
+            }
+        }
+
+        public byte[] GetSnapshot()
+        {
+            lock (_lock) { return _cachedJpeg; }
+        }
+
+        public async Task<byte[]> GetSnapshotAsync(int timeoutMs = 5000)
+        {
+            if (_mjpegActive)
+            {
+                lock (_lock) { return _cachedJpeg; }
+            }
+
+            if (!await _snapshotSem.WaitAsync(timeoutMs))
+            {
+                lock (_lock) { return _cachedJpeg; }
+            }
+
+            try
+            {
+                byte[] iFrame;
+                int w, h;
+                lock (_lock) { iFrame = _lastIFrame; w = _width; h = _height; }
+
+                if (iFrame == null || _sps == null || _pps == null)
+                {
+                    lock (_lock) { return _cachedJpeg; }
+                }
+
+                byte[] input = PrependSpsAndPps(iFrame);
+
+                byte[] jpeg = _useFFmpeg
+                    ? await DecodeOneFrameFFmpeg(input)
+                    : DecodeH264Sharp(input, isIFrame: true);
+
+                if (jpeg != null)
+                    lock (_lock) { _cachedJpeg = jpeg; }
+
+                lock (_lock) { return _cachedJpeg; }
+            }
+            finally
+            {
+                _snapshotSem.Release();
+            }
+        }
+
+        public IDisposable Subscribe(Action<byte[]> callback)
+        {
+            lock (_subLock) _subscribers.Add(callback);
+            return new Subscription(() => { lock (_subLock) _subscribers.Remove(callback); });
+        }
+
+        // â”€â”€ decode loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        private async Task DecodeLoop(CancellationToken ct)
+        {
+            if (_useFFmpeg)
+                return;
+
+            await foreach (var (data, isIFrame) in _queue.Reader.ReadAllAsync(ct))
+            {
+                try
+                {
+                    var jpeg = DecodeH264Sharp(data, isIFrame);
+                    if (jpeg != null)
+                    {
+                        lock (_lock) { _cachedJpeg = jpeg; }
+                        Notify(jpeg);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogUtils.debug($"[SNAP] DecodeLoop error: {ex.Message}");
+                }
+            }
+        }
+
+        // â”€â”€ H264Sharp â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        private byte[] DecodeH264Sharp(byte[] h264Data, bool isIFrame)
+        {
+            if (!_decoderReady)
+            {
+                _decoder.Initialize();
+                _decoderReady = true;
+            }
+
+            int w, h;
+            lock (_lock) { w = _width; h = _height; }
+
+            byte[] input = (isIFrame && _sps != null && _pps != null)
+                ? PrependSpsAndPps(h264Data)
+                : h264Data;
+
+            var rgb = new RgbImage(ImageFormat.Bgr, w, h);
+            bool ok = _decoder.Decode(input, 0, input.Length, false, out DecodingState state, ref rgb);
+
+            bool hasOutput = ok && (
+                state == DecodingState.dsErrorFree ||
+                state == DecodingState.dsDataErrorConcealed
+            );
+
+            if (!hasOutput)
+            {
+                LogUtils.debug($"[SNAP] H264Sharp skip: {state}");
+                return null;
+            }
+
+            return ToJpeg(rgb.GetBytes(), w, h);
+        }
+
+        // â”€â”€ FFmpeg persistent pipe â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        private void StartFFmpegPipe()
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "ffmpeg",
+                Arguments = "-hide_banner -loglevel error " +
+                            "-i pipe:0 " +
+                            "-q:v 4 -f image2pipe -vcodec mjpeg pipe:1",
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            _ffmpegProc = Process.Start(psi)!;
+            _ffmpegStdin = _ffmpegProc.StandardInput.BaseStream;
+
+            Task.Run(() => ReadFFmpegOutput(_ffmpegProc.StandardOutput.BaseStream, _cts.Token));
+            LogUtils.debug("[SNAP] FFmpeg pipe started");
+        }
+
+        private async Task<byte[]> DecodeOneFrameFFmpeg(byte[] h264Data)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "ffmpeg",
+                    Arguments = "-hide_banner -loglevel error " +
+                                "-i pipe:0 " +
+                                "-frames:v 1 -q:v 2 -f image2 pipe:1",
+                    UseShellExecute = false,
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    CreateNoWindow = true
+                };
+
+                using var proc = Process.Start(psi)!;
+                await proc.StandardInput.BaseStream.WriteAsync(h264Data);
+                proc.StandardInput.Close();
+
+                using var ms = new MemoryStream();
+                await proc.StandardOutput.BaseStream.CopyToAsync(ms);
+                await proc.WaitForExitAsync();
+
+                return ms.Length > 0 ? ms.ToArray() : null;
+            }
+            catch (Exception ex)
+            {
+                LogUtils.debug($"[SNAP] Snapshot FFmpeg error: {ex.Message}");
+                return null;
+            }
+        }
+
+        private void ReadFFmpegOutput(Stream stdout, CancellationToken ct)
+        {
+            var buf = new List<byte>(256_000);
+            var tmp = new byte[8192];
+
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    int n = stdout.Read(tmp, 0, tmp.Length);
+                    if (n == 0) break;
+
+                    buf.AddRange(new ArraySegment<byte>(tmp, 0, n));
+
+                    int start = FindBytes(buf, 0xFF, 0xD8);
+                    if (start < 0) continue;
+
+                    int end = FindBytes(buf, 0xFF, 0xD9, start + 2);
+                    if (end < 0) continue;
+
+                    int jpegLen = end + 2 - start;
+                    var jpeg = buf.GetRange(start, jpegLen).ToArray();
+                    buf.RemoveRange(0, end + 2);
+
+                    if (jpeg.Length > 1000)
+                    {
+                        lock (_lock) { _cachedJpeg = jpeg; }
+                        Notify(jpeg);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogUtils.debug($"[SNAP] FFmpeg output error: {ex.Message}");
+            }
+        }
+
+        private static int FindBytes(List<byte> buf, byte b0, byte b1, int from = 0)
+        {
+            for (int i = from; i < buf.Count - 1; i++)
+                if (buf[i] == b0 && buf[i + 1] == b1) return i;
+            return -1;
+        }
+
+        // â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        private void ExtractSpsAndPps(byte[] h264Data)
+        {
+            var nals = FindNalUnits(h264Data);
+            foreach (var nal in nals)
+            {
+                if (nal.Length == 0) continue;
+                int t = nal[0] & 0x1F;
+                if (t == 7) { _sps = (byte[])nal.Clone(); LogUtils.debug($"[SNAP] SPS {_sps.Length}b"); }
+                if (t == 8) { _pps = (byte[])nal.Clone(); LogUtils.debug($"[SNAP] PPS {_pps.Length}b"); }
+            }
+        }
+
+        private static List<byte[]> FindNalUnits(byte[] data)
+        {
+            var result = new List<byte[]>();
+            int i = 0;
+            int len = data.Length;
+            while (i + 3 <= len)
+            {
+                int scLen = 0;
+                if (data[i] == 0 && data[i + 1] == 0)
+                {
+                    if (data[i + 2] == 1) scLen = 3;
+                    else if (i + 4 <= len && data[i + 2] == 0 && data[i + 3] == 1) scLen = 4;
+                }
+
+                if (scLen > 0)
+                {
+                    int start = i + scLen;
+                    int next = start;
+                    while (next + 3 <= len)
+                    {
+                        if (data[next] == 0 && data[next + 1] == 0 && (data[next + 2] == 1 || (next + 4 <= len && data[next + 2] == 0 && data[next + 3] == 1)))
+                            break;
+                        next++;
+                    }
+                    if (next + 3 > len) next = len;
+                    var nal = new byte[next - start];
+                    Array.Copy(data, start, nal, 0, nal.Length);
+                    result.Add(nal);
+                    i = next;
+                }
+                else
+                {
+                    i++;
+                }
+            }
+            return result;
+        }
+
+        private byte[] PrependSpsAndPps(byte[] idrFrame)
+        {
+            byte[] sc = { 0x00, 0x00, 0x00, 0x01 };
+            using var ms = new MemoryStream();
+            ms.Write(sc); ms.Write(_sps);
+            ms.Write(sc); ms.Write(_pps);
+            ms.Write(idrFrame);
+            return ms.ToArray();
+        }
+
+        private static byte[] ToJpeg(byte[] bgr, int w, int h)
+        {
+            using var img = Image.LoadPixelData<Bgr24>(bgr, w, h);
+            using var ms = new MemoryStream();
+            img.Save(ms, new JpegEncoder { Quality = 80 });
+            return ms.ToArray();
+        }
+
+        private void Notify(byte[] jpeg)
+        {
+            List<Action<byte[]>> subs;
+            lock (_subLock) subs = new(_subscribers);
+            foreach (var s in subs) try { s(jpeg); } catch { }
+        }
+
+        private bool IsFFmpegAvailable()
+        {
+            try
+            {
+                var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "ffmpeg",
+                        Arguments = "-version",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
+
+                process.Start();
+                bool exited = process.WaitForExit(2000);
+                return exited && process.ExitCode == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // â”€â”€ dispose â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        public void Dispose()
+        {
+            _cts.Cancel();
+            _queue.Writer.Complete();
+
+            try { _ffmpegStdin?.Close(); } catch { }
+            try { _ffmpegProc?.WaitForExit(2000); } catch { }
+            try { _ffmpegProc?.Kill(); } catch { }
+            _ffmpegProc?.Dispose();
+
+            _decoder?.Dispose();
+        }
+
+        private class Subscription(Action onDispose) : IDisposable
+        {
+            public void Dispose() => onDispose();
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\StatusResponse.cs ==========
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace V380Decoder.src
+{
+    public class StatusResponse
+    {
+        public string status { get; set; } = default!;
+        public DateTime timestamp { get; set; }
+    }
+}
+
+========== C:\c\V380Decoder\src\V380Client.cs ==========
+
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace V380Decoder.src
+{
+    public class V380Client : IDisposable
+    {
+        public SnapshotManager snapshotManager { get; private set; }
+        private TcpClient authClient, streamClient;
+        private NetworkStream authStream, streamStream;
+        private readonly string ip;
+        private readonly int port;
+        private readonly uint deviceId;
+        private readonly string username, password;
+        private readonly SourceStream source;
+        private readonly OutputMode mode;
+        private readonly bool enableMjpeg;
+        private uint authTicket, sessionId;
+        private ushort deviceVersion, communicationVersion;
+        private int frameWidth = 1280;
+        private int frameheight = 720;
+        private byte[] aesKey = new byte[16];
+        private bool needReconnect = false;
+        private DeviceInfo deviceInfo;
+
+
+        public V380Client(string ip, int port, uint deviceId, string username, string password, SourceStream source, OutputMode mode, bool enableMjpeg)
+        {
+            this.ip = ip;
+            this.port = port;
+            this.deviceId = deviceId;
+            this.username = username;
+            this.password = password;
+            this.source = source;
+            this.mode = mode;
+            this.enableMjpeg = enableMjpeg;
+            snapshotManager = new SnapshotManager();
+            snapshotManager.SetMjpegActive(enableMjpeg);
+        }
+
+        public void Run(RtspServer rtsp, CancellationToken ct)
+        {
+            SetDeviceInfo();
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    int auth = GetAuthTicket();
+                    if (auth == 0) continue;
+                    if (auth == -1) break;
+
+                    if (!StreamLogin())
+                    {
+                        Console.Error.WriteLine("[STREAM] Retrying...");
+                        streamStream?.Close(); streamClient?.Close();
+                        continue;
+                    }
+
+                    if (!StartStream())
+                    {
+                        Console.Error.WriteLine("[STREAM] Retrying...");
+                        continue;
+                    }
+
+                    ReceiveFrames(mode, rtsp, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    Console.Error.WriteLine("[STREAM] Operation cancelled");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ERROR] Fatal error: {ex.Message}");
+                    Console.Error.WriteLine($"[ERROR] Stack trace: {ex.StackTrace}");
+                    Thread.Sleep(3000);
+                }
+                finally
+                {
+                    Console.Error.WriteLine("[STREAM] Closing connection...");
+                    streamStream?.Close(); streamClient?.Close();
+                }
+            }
+        }
+
+        public int GetAuthTicket()
+        {
+            try
+            {
+                authClient = new TcpClient();
+                var r = authClient.BeginConnect(ip, port, null, null);
+                if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+                {
+                    Console.Error.WriteLine("[AUTH] failed connecting to socket. retrying...");
+                    return 0;
+                }
+                authClient.EndConnect(r);
+                authStream = authClient.GetStream();
+
+                var encryptedPassword = GeneratePassword(password);
+                var userBytes = Encoding.ASCII.GetBytes(username);
+                var cmd1167 = new byte[520];
+                WriteUInt32LE(cmd1167, 0, 1167); // command
+                if (source == SourceStream.Lan)
+                {
+                    WriteUInt32LE(cmd1167, 4, 120); // unknown1
+                    cmd1167[8] = 31; // unknown2 (version?)
+                    WriteUInt32LE(cmd1167, 9, 1); // unknown3            
+                    WriteUInt32LE(cmd1167, 13, deviceId); // deviceId
+                    Array.Copy(userBytes, 0, cmd1167, 49, Math.Min(userBytes.Length, 32)); //username
+                    Array.Copy(encryptedPassword, 0, cmd1167, 81, Math.Min(encryptedPassword.Length, 64)); //password
+                }
+                else
+                {
+                    WriteUInt32LE(cmd1167, 4, 1022); // unknown1
+                    cmd1167[8] = 31; // unknown2 (version?)
+                    WriteUInt32LE(cmd1167, 9, 1); // unknown3 
+                    WriteUInt32LE(cmd1167, 13, deviceId); // deviceId
+                    var hostnameBytes = Encoding.ASCII.GetBytes($"{deviceId}.nvdvr.net");
+                    Array.Copy(hostnameBytes, 0, cmd1167, 17, Math.Min(hostnameBytes.Length, 50)); //hostname
+                    WriteUInt32LE(cmd1167, 67, (uint)port); //port
+                    Array.Copy(userBytes, 0, cmd1167, 71, Math.Min(userBytes.Length, 32)); //username
+                    Array.Copy(encryptedPassword, 0, cmd1167, 103, Math.Min(encryptedPassword.Length, 64)); //password
+                }
+                if (!SendData(authStream, cmd1167))
+                {
+                    Console.Error.WriteLine("[AUTH] failed send request. retrying...");
+                    return 0;
+                }
+
+                var resp = ReceiveData(authStream, 256);
+                if (resp == null || resp.Length < 256)
+                {
+                    Console.Error.WriteLine("[AUTH] failed receive response. retrying...");
+                    return 0;
+                }
+
+                uint respCmd = ReadUInt32LE(resp, 0);
+                if (respCmd != 1168)
+                {
+                    Console.Error.WriteLine($"[AUTH] invalid response cmd: {respCmd} (expected 1168). retrying...");
+                    return 0;
+                }
+                uint loginResult = ReadUInt32LE(resp, 4);
+                if (loginResult != 1001 && loginResult != 1002)
+                {
+                    if (loginResult == 1011)
+                        Console.Error.WriteLine($"[AUTH] invalid username. exiting...");
+                    else if (loginResult == 1012)
+                        Console.Error.WriteLine($"[AUTH] invalid password. exiting...");
+                    else if (loginResult == 1018)
+                        Console.Error.WriteLine($"[AUTH] invalid device id. exiting...");
+                    else
+                        Console.Error.WriteLine($"[AUTH] login failed result: {loginResult} (expected 1001). exiting...");
+
+                    return -1;
+                }
+
+                uint resultValue = ReadUInt32LE(resp, 8);
+                byte version = resp[12];
+                uint ticket = ReadUInt32LE(resp, 13);
+                uint session = ReadUInt32LE(resp, 17);
+                byte deviceType = resp[21];
+                byte camType = resp[22];
+                uint vendorId = ReadUInt16LE(resp, 23);
+                uint isDomainExists = resp[25];
+                byte[] domainBytes = new byte[32];
+                Array.Copy(resp, 26, domainBytes, 0, 32);
+                string domain = Encoding.ASCII.GetString(domainBytes).TrimEnd('\0');
+
+                LogUtils.debug($"[AUTH] response success");
+                LogUtils.debug($"[AUTH] cmd: {respCmd}");
+                LogUtils.debug($"[AUTH] result: {loginResult}");
+                LogUtils.debug($"[AUTH] authTicket: {ticket} (0x{ticket:X})");
+                LogUtils.debug($"[AUTH] resultValue: {resultValue}");
+                LogUtils.debug($"[AUTH] version: {version}");
+                LogUtils.debug($"[AUTH] session: {session}");
+                LogUtils.debug($"[AUTH] deviceType: {deviceType}");
+                LogUtils.debug($"[AUTH] camType: {camType}");
+                LogUtils.debug($"[AUTH] vendorId: {vendorId}");
+                LogUtils.debug($"[AUTH] isDomainExists: {isDomainExists}");
+                LogUtils.debug($"[AUTH] domain: {domain}");
+
+                deviceVersion = version;
+                sessionId = session;
+                authTicket = ticket;
+
+                Console.Error.WriteLine($"[AUTH] success ticket={authTicket} deviceVersion={deviceVersion}");
+                authStream.Close(); authClient.Close();
+                return 1;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[AUTH] Error: {ex.Message}");
+                return 0;
+            }
+            finally
+            {
+                authStream?.Close(); authClient?.Close();
+            }
+        }
+
+
+        public bool StreamLogin()
+        {
+            streamClient = new TcpClient
+            {
+                NoDelay = true,
+                ReceiveBufferSize = 0x20000,
+                SendBufferSize = 0x10000
+            };
+            var r = streamClient.BeginConnect(ip, port, null, null);
+            if (!r.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+            {
+                Console.Error.WriteLine("[STREAM] failed connecting to socket. retrying...");
+                return false;
+            }
+            ;
+            streamClient.EndConnect(r);
+            streamStream = streamClient.GetStream();
+
+            var cmd301 = new byte[256];
+            WriteUInt32LE(cmd301, 0, 301);
+            if (source == SourceStream.Lan)
+            {
+                WriteUInt32LE(cmd301, 4, deviceId); //device id
+                WriteUInt32LE(cmd301, 8, 0); //unknown1 
+                WriteUInt16LE(cmd301, 12, 20); //unknown2 
+                WriteUInt32LE(cmd301, 14, authTicket); //auth ticket
+                WriteUInt32LE(cmd301, 22, 4097); //audio 4096=off, 4097=on
+                WriteUInt32LE(cmd301, 26, 1);    //quality  0=SD, 1=HD
+            }
+            else
+            {
+                WriteUInt32LE(cmd301, 4, 1022); //unknown1 
+                var hostnameBytes = Encoding.ASCII.GetBytes($"{deviceId}.nvdvr.net");
+                Array.Copy(hostnameBytes, 0, cmd301, 8, Math.Min(hostnameBytes.Length, 50)); //hostname
+                WriteUInt32LE(cmd301, 58, (uint)port); //port
+                WriteUInt32LE(cmd301, 62, deviceId); //device id
+                WriteUInt32LE(cmd301, 66, authTicket); // auth ticket
+                WriteUInt32LE(cmd301, 70, sessionId); // session id
+                WriteUInt32LE(cmd301, 74, 1); //quality 0=SD, 1=HD
+                cmd301[78] = 20; //unknown2 
+                WriteUInt32LE(cmd301, 79, 1); //unknown23
+            }
+
+            if (!SendData(streamStream, cmd301))
+            {
+                Console.Error.WriteLine("[STREAM] login failed send request");
+                return false;
+            }
+
+            var resp401 = ReceiveData(streamStream, 412);
+
+            if (resp401 == null || resp401.Length < 8)
+            {
+                Console.Error.WriteLine("[STREAM] login failed receive response");
+                return false;
+            }
+            var respCmd = ReadUInt32LE(resp401, 0);
+            if (respCmd != 401)
+            {
+                Console.Error.WriteLine($"[STREAM] login invalid response cmd: {respCmd} (expected 401)");
+                return false;
+            }
+
+            int result = (int)ReadUInt32LE(resp401, 4);
+            if (result == -11 || result == -12)
+            {
+                Console.Error.WriteLine($"[STREAM] login failed result={result}");
+                return false;
+            }
+
+            LogUtils.debug($"[STREAM] login response success");
+            LogUtils.debug($"[STREAM] login cmd: {respCmd}");
+            if (source == SourceStream.Lan)
+            {
+                ushort version = ReadUInt16LE(resp401, 8);
+                uint width = ReadUInt32LE(resp401, 10);
+                uint height = ReadUInt32LE(resp401, 14);
+                uint maxPackSize = ReadUInt32LE(resp401, 18);
+                byte audioFreq = resp401[22];
+                byte audioBits = resp401[23];
+                byte audioChannels = resp401[24];
+                communicationVersion = version;
+                frameWidth = (int)width;
+                frameheight = (int)height;
+                LogUtils.debug($"[STREAM] login result: {result}");
+                LogUtils.debug($"[STREAM] login version: {version}");
+                LogUtils.debug($"[STREAM] login width: {width}");
+                LogUtils.debug($"[STREAM] login height: {height}");
+                LogUtils.debug($"[STREAM] login maxPackSize: {maxPackSize}");
+                LogUtils.debug($"[STREAM] login audioFreq: {audioFreq}");
+                LogUtils.debug($"[STREAM] login audioBits: {audioBits}");
+                LogUtils.debug($"[STREAM] login audioChannels: {audioChannels}");
+            }
+
+            if (deviceVersion > 30) GenerateMediaKey(authTicket);
+            Console.Error.WriteLine($"[STREAM] login OK");
+            return true;
+        }
+
+        public bool StartStream()
+        {
+            Console.Error.WriteLine($"[STREAM] starting stream...");
+            var cmd303 = new byte[256];
+            WriteUInt32LE(cmd303, 0, 303);
+            WriteUInt16LE(cmd303, 4, 0x3001);
+            return SendData(streamStream, cmd303);
+        }
+
+        public void ReceiveFrames(OutputMode mode, RtspServer rtsp, CancellationToken ct)
+        {
+            bool needDecrypt = deviceVersion > 30;
+
+            var videoFrags = new List<byte>();
+            var audioFrags = new List<byte>();
+            ushort videoTotal = 0, audioTotal = 0;
+
+            var header12 = new byte[12];
+            var payloadBuf = new byte[65536];
+
+            // stdout is used only for Video or Audio output modes
+            Stream stdout = (mode == OutputMode.Video || mode == OutputMode.Audio)
+                ? Console.OpenStandardOutput()
+                : null;
+
+            Console.Error.WriteLine($"[RECV] mode={mode} decrypt={needDecrypt} communicationVersion={communicationVersion}");
+
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    if (needReconnect)
+                    {
+                        Console.Error.WriteLine($"[STREAM] lost, reconnecting... ");
+                        try { streamStream?.Close(); streamClient?.Close(); } catch { }
+                        if (!StreamLogin()) break;
+                        if (!StartStream()) break;
+                        needReconnect = false;
+                    }
+
+                    // 12-byte fragment header
+                    if (ReadExact(streamStream, header12, 0, 12) < 12) continue;
+
+                    if (header12[0] != 0x7F)
+                    {
+                        continue;
+                    }
+
+                    byte type = header12[1];
+                    ushort totalFrame = ReadUInt16LE(header12, 3);
+                    ushort curFrame = ReadUInt16LE(header12, 5);
+                    ushort payLen = ReadUInt16LE(header12, 7);
+
+                    if (payLen == 0 || payLen > 20000 || totalFrame == 0 || curFrame >= totalFrame)
+                    {
+                        Console.Error.WriteLine($"[SKIP] invalid header type=0x{type:X2} total={totalFrame} cur={curFrame} len={payLen}");
+                        continue;
+                    }
+
+                    if (payloadBuf.Length < payLen) payloadBuf = new byte[payLen];
+                    if (ReadExact(streamStream, payloadBuf, 0, payLen) < payLen) continue;
+
+                    // VIDEO  0x00=I-frame  0x01=P-frame  0x28/0x29=alt-video (fw v32+)
+                    if (type == 0x00 || type == 0x01 || type == 0x28 || type == 0x29)
+                    {
+                        if (curFrame == 0) { videoFrags.Clear(); videoTotal = totalFrame; }
+                        if (totalFrame != videoTotal) { videoFrags.Clear(); videoTotal = totalFrame; }
+
+                        videoFrags.AddRange(payloadBuf.AsSpan(0, payLen));
+
+                        if (curFrame != totalFrame - 1) continue;
+                        if (videoFrags.Count < 16) { videoFrags.Clear(); continue; }
+
+                        byte[] full = videoFrags.ToArray();
+                        videoFrags.Clear();
+
+                        byte[] payload;
+                        bool isIFrame;
+
+                        //parse inner 16-byte frame header
+                        uint frameId = ReadUInt32LE(full, 0);
+                        ushort frameType = ReadUInt16LE(full, 4);
+                        ushort frameRate = ReadUInt16LE(full, 6);
+                        ulong timestamp = ReadUInt64LE(full, 8);
+
+                        payload = new byte[full.Length - 16];
+                        Array.Copy(full, 16, payload, 0, payload.Length);
+                        isIFrame = type == 0x00 || type == 0x28;
+
+                        if (needDecrypt)
+                        {
+                            if (communicationVersion == 21)
+                                DecryptMediaPre2k(payload, payload.Length, 1);
+                            else
+                                DecryptVideoFrame(payload, payload.Length);
+                        }
+
+                        // Search for H.264/H.265 Annex-B start code within first 16 bytes
+                        int scPos = -1;
+                        int searchEnd = Math.Min(16, payload.Length - 3);
+                        for (int i = 0; i < searchEnd; i++)
+                        {
+                            if (payload[i] == 0 && payload[i + 1] == 0 && payload[i + 2] == 1)
+                            {
+                                scPos = i;
+                                if (i > 0 && payload[i - 1] == 0)
+                                    scPos = i - 1;
+                                break;
+                            }
+                        }
+
+                        if (scPos < 0)
+                        {
+                            Console.Error.WriteLine($"[VIDEO] bad start code, len={payload.Length}");
+                            continue;
+                        }
+
+                        if (scPos > 0)
+                        {
+                            byte[] trimmed = new byte[payload.Length - scPos];
+                            Array.Copy(payload, scPos, trimmed, 0, trimmed.Length);
+                            payload = trimmed;
+                        }
+
+                        snapshotManager.UpdateFrame(payload, frameWidth, frameheight, isIFrame: type == 0x00);
+
+                        var fd = new FrameData
+                        {
+                            RawType = type,
+                            FrameId = frameId,
+                            FrameType = frameType,
+                            FrameRate = frameRate,
+                            Timestamp = timestamp,
+                            Payload = payload
+                        };
+
+                        if (mode == OutputMode.Video)
+                        {
+                            stdout.Write(payload, 0, payload.Length);
+                            stdout.Flush();
+                        }
+                        else if (mode == OutputMode.Rtsp)
+                        {
+                            rtsp?.PushVideo(fd);
+                        }
+                    }
+
+                    // AUDIO  0x1A
+                    else if (type == 0x1A)
+                    {
+                        if (curFrame == 0) { audioFrags.Clear(); audioTotal = totalFrame; }
+                        if (totalFrame != audioTotal) { audioFrags.Clear(); audioTotal = totalFrame; }
+
+                        audioFrags.AddRange(payloadBuf.AsSpan(0, payLen));
+
+                        if (curFrame != totalFrame - 1) continue;
+                        if (audioFrags.Count < 16) { audioFrags.Clear(); continue; }
+
+                        byte[] full = audioFrags.ToArray();
+                        audioFrags.Clear();
+
+                        //parse inner 16-byte frame header
+                        uint frameId = ReadUInt32LE(full, 0);
+                        ushort frameType = ReadUInt16LE(full, 4);
+                        ushort frameRate = ReadUInt16LE(full, 6);
+                        ulong timestamp = ReadUInt64LE(full, 8);
+
+                        byte[] payload = new byte[full.Length - 16];
+                        Array.Copy(full, 16, payload, 0, payload.Length);
+
+                        if (needDecrypt)
+                        {
+                            if (communicationVersion == 21)
+                                DecryptMediaPre2k(payload, payload.Length, 1);
+                            else
+                                DecryptAudioFrame(payload, payload.Length);
+                        }
+
+                        var fd = new FrameData
+                        {
+                            RawType = type,
+                            FrameId = frameId,
+                            FrameType = frameType,
+                            FrameRate = frameRate,
+                            Timestamp = timestamp,
+                            Payload = payload
+                        };
+
+                        if (mode == OutputMode.Audio)
+                        {
+                            stdout.Write(payload, 0, payload.Length);
+                            stdout.Flush();
+                        }
+                        else if (mode == OutputMode.Rtsp)
+                        {
+                            rtsp?.PushAudio(fd);
+                        }
+                    }
+                    else if (type == 0x5B)
+                    {
+                        continue;
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine($"[FRAME] unknown type=0x{type:X2} len={payLen}");
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Console.Error.WriteLine("[RECV] Operation cancelled");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[RECV] {ex.Message}");
+            }
+        }
+
+        private void DecryptVideoFrame(byte[] data, int length)
+        {
+            using var aes = Aes.Create();
+            aes.Key = aesKey; aes.Mode = CipherMode.ECB; aes.Padding = PaddingMode.None;
+            using var dec = aes.CreateDecryptor();
+            for (int offset = 0; offset + 64 <= length; offset += 80)
+                for (int i = 0; i < 4; i++)
+                    dec.TransformBlock(data, offset + i * 16, 16, data, offset + i * 16);
+        }
+
+        private void DecryptAudioFrame(byte[] data, int length)
+        {
+            int alignedSize = (length / 16) * 16;
+            if (alignedSize == 0) return;
+
+            using var aes = Aes.Create();
+            aes.Key = aesKey;
+            aes.Mode = CipherMode.ECB;
+            aes.Padding = PaddingMode.None;
+            using var dec = aes.CreateDecryptor();
+            for (int i = 0; i < alignedSize; i += 16)
+                dec.TransformBlock(data, i, 16, data, i);
+        }
+
+        // Not tested
+        private void DecryptMediaPre2k(byte[] data, int length, int mode)
+        {
+            int decryptLength;
+            if (mode == 0 && length > 2048)
+            {
+                decryptLength = 2048;
+            }
+            else
+            {
+                decryptLength = (length / 16) * 16;
+            }
+            if (decryptLength > 0)
+            {
+                using var aes = Aes.Create();
+                aes.Key = aesKey;
+                aes.Mode = CipherMode.ECB;
+                aes.Padding = PaddingMode.None;
+                using var decryptor = aes.CreateDecryptor();
+                decryptor.TransformBlock(data, 0, decryptLength, data, 0);
+            }
+        }
+
+        void GenerateMediaKey(uint ticket)
+        {
+            WriteUInt32LE(aesKey, 0, ticket);
+            WriteUInt64LE(aesKey, 4, 0x618123462c14795c);
+            WriteUInt32LE(aesKey, 12, 0x82800df0);
+            LogUtils.debug($"[KEY] {BitConverter.ToString(aesKey).Replace("-", "")}");
+        }
+
+        byte[] GeneratePassword(string pw)
+        {
+            byte[] sk = Encoding.ASCII.GetBytes("macrovideo+*#!^@");
+            var rng = new Random();
+            byte[] rk = new byte[16];
+            const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            for (int i = 0; i < 16; i++) rk[i] = (byte)chars[rng.Next(chars.Length)];
+
+            var pb = Encoding.ASCII.GetBytes(pw);
+            var pad = new byte[48];
+            Array.Copy(pb, pad, Math.Min(pb.Length, 48));
+
+            void Enc(byte[] key)
+            {
+                using var a = Aes.Create();
+                a.Key = key; a.Mode = CipherMode.ECB; a.Padding = PaddingMode.None;
+                using var e = a.CreateEncryptor();
+                for (int i = 0; i < 48; i += 16) e.TransformBlock(pad, i, 16, pad, i);
+            }
+            Enc(sk); Enc(rk);
+
+            var out_ = new byte[64];
+            Array.Copy(rk, 0, out_, 0, 16);
+            Array.Copy(pad, 0, out_, 16, 48);
+            return out_;
+        }
+
+        bool SendData(NetworkStream s, byte[] d)
+        {
+            try { s.Write(d, 0, d.Length); s.Flush(); return true; }
+            catch (Exception ex) { Console.Error.WriteLine($"[SEND] {ex.Message}"); return false; }
+        }
+
+        byte[] ReceiveData(NetworkStream s, int max)
+        {
+            var buf = new byte[max];
+            int tot = 0;
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < deadline && tot < max)
+            {
+                if (s.DataAvailable || tot > 0)
+                {
+                    int n = s.Read(buf, tot, max - tot);
+                    if (n <= 0) break;
+                    tot += n;
+                }
+                else Thread.Sleep(10);
+            }
+            if (tot == 0) return null;
+            var r = new byte[tot];
+            Array.Copy(buf, r, tot);
+            return r;
+        }
+
+        int ReadExact(NetworkStream s, byte[] buf, int off, int cnt)
+        {
+            int tot = 0;
+            var deadline = DateTime.Now.AddSeconds(15);
+            while (tot < cnt)
+            {
+                if (DateTime.Now > deadline)
+                {
+                    needReconnect = true;
+                    return tot;
+                }
+                if (!s.DataAvailable)
+                {
+                    Thread.Sleep(10);
+                    continue;
+                }
+                int n = s.Read(buf, off + tot, cnt - tot);
+                if (n <= 0) break;
+                tot += n;
+            }
+            return tot;
+        }
+
+        void WriteUInt32LE(byte[] b, int o, uint v) { b[o] = (byte)v; b[o + 1] = (byte)(v >> 8); b[o + 2] = (byte)(v >> 16); b[o + 3] = (byte)(v >> 24); }
+        void WriteUInt16LE(byte[] b, int o, ushort v) { b[o] = (byte)v; b[o + 1] = (byte)(v >> 8); }
+        void WriteUInt64LE(byte[] b, int o, ulong v) { for (int i = 0; i < 8; i++) b[o + i] = (byte)(v >> (i * 8)); }
+        uint ReadUInt32LE(byte[] b, int o) => (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24));
+        ushort ReadUInt16LE(byte[] b, int o) => (ushort)(b[o] | (b[o + 1] << 8));
+        ulong ReadUInt64LE(byte[] b, int o) { ulong v = 0; for (int i = 0; i < 8; i++) v |= ((ulong)b[o + i]) << (i * 8); return v; }
+
+        public bool PtzRight() => SendControl(V380Commands.PTZ_RIGHT);
+        public bool PtzLeft() => SendControl(V380Commands.PTZ_LEFT);
+        public bool PtzUp() => SendControl(V380Commands.PTZ_UP);
+        public bool PtzDown() => SendControl(V380Commands.PTZ_DOWN);
+        public bool PtzStop() => SendControl(V380Commands.PTZ_STOP);
+        public bool LightOn() => SendControl(V380Commands.LIGHT_ON);
+        public bool LightOff() => SendControl(V380Commands.LIGHT_OFF);
+        public bool LightAuto() => SendControl(V380Commands.LIGHT_AUTO);
+
+        private const int SirenRepeatMilliseconds = 500;
+        // All siren writes and state changes happen under sirenLock. Every SirenOn/SirenOff/Dispose bumps
+        // sirenGeneration, so a repeat worker from an older generation can never send another SIREN_ON.
+        private readonly object sirenLock = new();
+        private CancellationTokenSource sirenCancellation;
+        private int sirenGeneration;
+
+        /// <summary>Sounds the siren for the given time: the camera keeps it on only while SIREN_ON keeps arriving,
+        /// so it is repeated every 500 ms (as the official app does) until SirenOff() or the time runs out.
+        /// Returns false when the first SIREN_ON could not be sent.</summary>
+        public bool SirenOn(int seconds)
+        {
+            CancellationTokenSource cancellation;
+            int generation;
+            lock (sirenLock)
+            {
+                StopSirenWorker();
+                if (!SendControl(V380Commands.SIREN_ON)) return false;
+                generation = sirenGeneration;
+                cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(seconds));
+                sirenCancellation = cancellation;
+            }
+            _ = Task.Run(() => RepeatSiren(cancellation, generation));
+            return true;
+        }
+
+        public bool SirenOff()
+        {
+            lock (sirenLock)
+            {
+                StopSirenWorker();
+                return SendControl(V380Commands.SIREN_OFF);
+            }
+        }
+
+        private async Task RepeatSiren(CancellationTokenSource cancellation, int generation)
+        {
+            try
+            {
+                while (true)
+                {
+                    await Task.Delay(SirenRepeatMilliseconds, cancellation.Token);
+                    lock (sirenLock)
+                    {
+                        if (generation != sirenGeneration) return;
+                        SendControl(V380Commands.SIREN_ON);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Time is up. Send OFF only if nobody else has taken over the siren meanwhile.
+                lock (sirenLock)
+                {
+                    if (generation != sirenGeneration) return;
+                    StopSirenWorker();
+                    SendControl(V380Commands.SIREN_OFF);
+                }
+            }
+            finally
+            {
+                cancellation.Dispose();
+            }
+        }
+
+        // Caller holds sirenLock. The worker disposes its own CancellationTokenSource when it exits.
+        private void StopSirenWorker()
+        {
+            sirenGeneration++;
+            sirenCancellation?.Cancel();
+            sirenCancellation = null;
+        }
+        public bool ImageColor() => SendControl(V380Commands.IMAGE_COLOR);
+        public bool ImageBW() => SendControl(V380Commands.IMAGE_BW);
+        public bool ImageAuto() => SendControl(V380Commands.IMAGE_AUTO);
+        public bool ImageFlip() => SendControl(V380Commands.IMAGE_FLIP);
+        private bool SendControl(byte[] payload)
+        {
+            if (streamStream == null) return false;
+            return SendData(streamStream, payload);
+        }
+
+        public string GetDeviceId()
+        {
+            return deviceId.ToString();
+        }
+
+        public string GetDeviceVersion()
+        {
+            return deviceVersion.ToString();
+        }
+
+        public DeviceInfo GetDeviceInfo()
+        {
+            return deviceInfo;
+        }
+
+        public void SetDeviceInfo()
+        {
+            var discovery = new DeviceDiscovery();
+            var devices = discovery.Discover();
+            foreach (var dev in devices)
+            {
+                if (dev.DevId == deviceId.ToString())
+                {
+                    deviceInfo = dev;
+                    break;
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (sirenLock)
+            {
+                // Best effort: stop an active siren while the stream is still open.
+                if (sirenCancellation != null)
+                {
+                    StopSirenWorker();
+                    SendControl(V380Commands.SIREN_OFF);
+                }
+            }
+            authStream?.Close(); authClient?.Close();
+            streamStream?.Close(); streamClient?.Close();
+            snapshotManager?.Dispose();
+        }
+    }
+}
+
+
+
+
+========== C:\c\V380Decoder\src\V380Commands.cs ==========
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace V380Decoder.src
+{
+    public class V380Commands
+    {
+        public static readonly byte[] PTZ_RIGHT = [0xaa, 0x00, 0x00, 0x00, 0xe8, 0x03, 0xe8, 0x03, 0xea, 0x03, 0xe8, 0x03, 0x00, 0x00, 0x01, 0x00];
+        public static readonly byte[] PTZ_LEFT = [0xaa, 0x00, 0x00, 0x00, 0xe8, 0x03, 0xe8, 0x03, 0xe9, 0x03, 0xe8, 0x03, 0x00, 0x00, 0x01, 0x00];
+        public static readonly byte[] PTZ_UP = [0xaa, 0x00, 0x00, 0x00, 0xe8, 0x03, 0xe8, 0x03, 0xe8, 0x03, 0xeb, 0x03, 0x00, 0x00, 0x01, 0x00];
+        public static readonly byte[] PTZ_DOWN = [0xaa, 0x00, 0x00, 0x00, 0xe8, 0x03, 0xe8, 0x03, 0xe8, 0x03, 0xec, 0x03, 0x00, 0x00, 0x01, 0x00];
+        public static readonly byte[] PTZ_STOP = [0xaa, 0x00, 0x00, 0x00, 0xe8, 0x03, 0xe8, 0x03, 0xe8, 0x03, 0xe8, 0x03, 0x00, 0x00, 0x01, 0x00];
+        public static readonly byte[] LIGHT_ON = [0xc4, 0x00, 0x00, 0x00, 0xe9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        public static readonly byte[] LIGHT_OFF = [0xc4, 0x00, 0x00, 0x00, 0xea, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        public static readonly byte[] LIGHT_AUTO = [0xc4, 0x00, 0x00, 0x00, 0xeb, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        // Siren (built-in speaker alarm). Captured from the official app: it repeats SIREN_ON every ~500 ms
+        // while the siren should sound, and sends SIREN_OFF once to stop it.
+        public static readonly byte[] SIREN_ON = [0xb9, 0x00, 0x00, 0x00, 0xe9, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        public static readonly byte[] SIREN_OFF = [0xb9, 0x00, 0x00, 0x00, 0xea, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        public static readonly byte[] IMAGE_COLOR = [0xc5, 0x0, 0x0, 0x0, 0xe9, 0x3, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+        public static readonly byte[] IMAGE_BW = [0xc5, 0x0, 0x0, 0x0, 0xea, 0x3, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+        public static readonly byte[] IMAGE_AUTO = [0xc5, 0x0, 0x0, 0x0, 0xeb, 0x3, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+        public static readonly byte[] IMAGE_FLIP = [0xbe, 0x0, 0x0, 0x0, 0xe8, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+    }
+}
+
+========== C:\c\V380Decoder\src\WebPage.cs ==========
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace V380Decoder.src
+{
+    public class WebPage
+    {
+        public static string GetHtml(bool enableMjpeg)
+        {
+            string sectionMjpeg = enableMjpeg ? @"
+            <div class='section'>
+                <div class='section-title'>Live Stream</div>
+                <img class='live-frame' alt='Loading stream...' src='/mjpeg'>
+            </div>
+            " : "";
+            return $@"
+            <!DOCTYPE html>
+            <html>
+
+            <head>
+                <title>V380 Control Panel</title>
+                <meta name='viewport' content='width=device-width, initial-scale=1'>
+                <style>
+                    * {{
+                        margin: 0;
+                        padding: 0;
+                        box-sizing: border-box;
+                    }}
+
+                    body {{
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                        background: linear-gradient(135deg, #ABDCFF 0%, #0396FF 100%);
+                        min-height: 100vh;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        padding: 20px;
+                    }}
+
+                    .container {{
+                        background: white;
+                        border-radius: 20px;
+                        padding: 30px;
+                        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+                        max-width: 700px;
+                        width: 100%;
+                    }}
+
+                    h1 {{
+                        text-align: center;
+                        color: #333;
+                        margin-bottom: 30px;
+                        font-size: 28px;
+                    }}
+
+                    .section {{
+                        margin-bottom: 30px;
+                    }}
+
+                    .section-title {{
+                        font-size: 16px;
+                        font-weight: 600;
+                        color: #666;
+                        margin-bottom: 15px;
+                        text-transform: uppercase;
+                        letter-spacing: 1px;
+                    }}
+
+                    .ptz-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(3, 1fr);
+                        gap: 10px;
+                        margin-bottom: 10px;
+                    }}
+
+                    .btn {{
+                        padding: 15px;
+                        border: none;
+                        border-radius: 10px;
+                        font-size: 16px;
+                        font-weight: 600;
+                        cursor: pointer;
+                        transition: all 0.2s;
+                        background: #0396FF;
+                        color: white;
+                        box-shadow: 0 4px 15px rgb(3, 150, 255, 0.4);
+                    }}
+
+                    .btn:hover {{
+                        transform: translateY(-2px);
+                        box-shadow: 0 6px 20px rgb(3, 150, 255, 0.6);
+                    }}
+
+                    .btn:active {{
+                        transform: translateY(0);
+                    }}
+
+                    .btn-group-light {{
+                        display: grid;
+                        grid-template-columns: repeat(3, 1fr);
+                        gap: 10px;
+                    }}
+
+                    .btn-group-image {{
+                        display: grid;
+                        grid-template-columns: repeat(4, 1fr);
+                        gap: 10px;
+                    }}
+
+                    .btn-secondary {{
+                        background: #48bb78;
+                        box-shadow: 0 4px 15px rgba(72, 187, 120, 0.4);
+                    }}
+
+                    .btn-secondary:hover {{
+                        box-shadow: 0 6px 20px rgba(72, 187, 120, 0.6);
+                    }}
+
+                    .btn-tertiary {{
+                        background: #ed8936;
+                        box-shadow: 0 4px 15px rgba(237, 137, 54, 0.4);
+                    }}
+
+                    .btn-tertiary:hover {{
+                        box-shadow: 0 6px 20px rgba(237, 137, 54, 0.6);
+                    }}
+
+                    .status {{
+                        margin-top: 20px;
+                        padding: 15px;
+                        border-radius: 10px;
+                        background: #f7fafc;
+                        text-align: center;
+                        font-size: 14px;
+                        color: #666;
+                        display: none;
+                    }}
+
+                    .status.show {{
+                        display: block;
+                    }}
+
+                    .status.success {{
+                        background: #c6f6d5;
+                        color: #22543d;
+                    }}
+
+                    .status.error {{
+                        background: #fed7d7;
+                        color: #742a2a;
+                    }}
+
+                    .empty {{
+                        grid-column: 2;
+                    }}
+
+                    .live-frame {{
+                        width: 100%;
+                        aspect-ratio: 16 / 9;
+                        object-fit: cover;
+                        border-radius: 15px;
+                    }}
+                </style>
+            </head>
+
+            <body>
+                <div class='container'>
+                    <h1>V380 Control</h1>
+
+                    {sectionMjpeg}
+                    
+                    <div class='section'>
+                        <div class='section-title'>PTZ Control</div>
+                        <div class='ptz-grid'>
+                            <div></div>
+                            <button class='btn' onclick='cmd(""/api/ptz/up"")'>UP</button>
+                            <div></div>
+                            <button class='btn' onclick='cmd(""/api/ptz/left"")'>LEFT</button>
+                            <button class='btn' onclick='cmd(""/api/ptz/stop"")'>STOP</button>
+                            <button class='btn' onclick='cmd(""/api/ptz/right"")'>RIGHT</button>
+                            <div></div>
+                            <button class='btn' onclick='cmd(""/api/ptz/down"")'>DOWN</button>
+                            <div></div>
+                        </div>
+                    </div>
+
+                    <div class='section'>
+                        <div class='section-title'>Light Control</div>
+                        <div class='btn-group-light'>
+                            <button class='btn btn-secondary' onclick='cmd(""/api/light/on"")'>ON</button>
+                            <button class='btn btn-secondary' onclick='cmd(""/api/light/off"")'>OFF</button>
+                            <button class='btn btn-secondary' onclick='cmd(""/api/light/auto"")'>AUTO</button>
+                        </div>
+                    </div>
+
+                    <div class='section'>
+                        <div class='section-title'>Siren (tested on fw 32 only)</div>
+                        <div class='btn-group-light'>
+                            <button class='btn btn-secondary' onclick='cmd(""/api/siren/on?seconds=5"")'>ON 5s</button>
+                            <button class='btn btn-secondary' onclick='cmd(""/api/siren/off"")'>OFF</button>
+                        </div>
+                    </div>
+
+                    <div class='section'>
+                        <div class='section-title'>Image Mode</div>
+                        <div class='btn-group-image'>
+                            <button class='btn btn-tertiary' onclick='cmd(""/api/image/color"")'>COLOR</button>
+                            <button class='btn btn-tertiary' onclick='cmd(""/api/image/bw"")'>B&W</button>
+                            <button class='btn btn-tertiary' onclick='cmd(""/api/image/auto"")'>AUTO</button>
+                            <button class='btn btn-tertiary' onclick='cmd(""/api/image/flip"")'>FLIP</button>
+                        </div>
+                    </div>
+
+                </div>
+
+                <script>
+                    async function cmd(url) {{
+                        try {{
+                            const res = await fetch(url, {{ method: 'POST' }});
+                            if (!res.ok) console.error('Command failed:', res.status);
+                        }} catch (e) {{
+                            console.error('Request error:', e);
+                        }}
+                    }}
+                </script>
+            </body>
+
+            </html>";
+        }
+    }
+}
+
+========== C:\c\V380Decoder\src\WebServer.cs ==========
+
+using System.Text;
+using System.Text.RegularExpressions;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+
+namespace V380Decoder.src
+{
+    public class WebServer
+    {
+        private readonly V380Client client;
+        private readonly int httpPort;
+        private readonly int rtspPort;
+        private readonly bool enableApi;
+        private readonly bool enableOnvif;
+        private readonly bool enableMjpeg;
+        private readonly bool secure;
+        private readonly string username;
+        private readonly string password;
+        private WebApplication app;
+        public WebServer(
+            int httpPort,
+            int rtspPort,
+            V380Client client,
+            bool enableApi,
+            bool enableOnvif,
+            bool enableMjpeg,
+            bool secure,
+            string username,
+            string password)
+        {
+            this.httpPort = httpPort;
+            this.rtspPort = rtspPort;
+            this.client = client;
+            this.enableApi = enableApi;
+            this.enableOnvif = enableOnvif;
+            this.enableMjpeg = enableMjpeg;
+            this.secure = secure;
+            this.username = username;
+            this.password = password;
+        }
+
+        public void Start()
+        {
+            string ipAddress = NetworkHelper.GetLocalIPAddress();
+            string basicAuth = string.Empty;
+            var builder = WebApplication.CreateBuilder();
+            builder.WebHost.UseUrls($"http://*:{httpPort}");
+
+            builder.Logging.ClearProviders();
+            builder.Services.ConfigureHttpJsonOptions(options =>
+            {
+                options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
+            });
+
+            app = builder.Build();
+
+            RouteGroupBuilder api = app.MapGroup("/");
+            if (secure)
+            {
+                basicAuth = $"{username}:{password}@";
+                api.AddEndpointFilter(async (context, next) =>
+                {
+                    var http = context.HttpContext;
+
+                    var auth = http.Request.Headers.Authorization.ToString();
+
+                    if (string.IsNullOrEmpty(auth) ||
+                        !auth.StartsWith("Basic "))
+                    {
+                        http.Response.StatusCode = 401;
+
+                        http.Response.Headers.WWWAuthenticate =
+                            @"Basic realm=""V380 Authentication""";
+
+                        return Results.Empty;
+                    }
+
+                    var encoded = auth["Basic ".Length..].Trim();
+
+                    var credential = Encoding.UTF8.GetString(
+                        Convert.FromBase64String(encoded));
+
+                    var parts = credential.Split(':', 2);
+
+                    if (parts.Length != 2 ||
+                        parts[0] != username ||
+                        parts[1] != password)
+                    {
+                        http.Response.StatusCode = 401;
+                        return Results.Empty;
+                    }
+
+                    return await next(context);
+                });
+            }
+
+            Console.Error.WriteLine($"[SNAPSHOT] http://{basicAuth}{ipAddress}:{httpPort}/snapshot");
+            api.MapGet("/snapshot", async (HttpContext ctx) =>
+            {
+                var jpeg = await client.snapshotManager.GetSnapshotAsync(timeoutMs: 5000);
+
+                if (jpeg == null)
+                    return Results.Problem("No snapshot available yet", statusCode: 503);
+
+                ctx.Response.Headers.CacheControl = "no-cache";
+                return Results.File(jpeg, "image/jpeg");
+            });
+
+            if (enableMjpeg)
+            {
+                Console.Error.WriteLine($"[MJPEG] http://{basicAuth}{ipAddress}:{httpPort}/mjpeg");
+                api.MapGet("/mjpeg", async (HttpContext ctx, CancellationToken ct) =>
+                {
+                    const string boundary = "mjpegframe";
+                    ctx.Response.ContentType = $"multipart/x-mixed-replace; boundary={boundary}";
+                    ctx.Response.Headers.CacheControl = "no-cache";
+
+                    var ch = System.Threading.Channels.Channel.CreateBounded<byte[]>(
+                        new System.Threading.Channels.BoundedChannelOptions(2)
+                        {
+                            FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
+                        });
+
+                    using var sub = client.snapshotManager.Subscribe(jpeg => ch.Writer.TryWrite(jpeg));
+
+                    try
+                    {
+                        await foreach (var jpeg in ch.Reader.ReadAllAsync(ct))
+                        {
+                            var header = System.Text.Encoding.ASCII.GetBytes(
+                                $"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {jpeg.Length}\r\n\r\n");
+
+                            await ctx.Response.Body.WriteAsync(header, ct);
+                            await ctx.Response.Body.WriteAsync(jpeg, ct);
+                            await ctx.Response.Body.WriteAsync("\r\n"u8.ToArray(), ct);
+                            await ctx.Response.Body.FlushAsync(ct);
+                        }
+                    }
+                    catch (OperationCanceledException) { }
+                });
+            }
+
+            if (enableApi)
+            {
+                Console.Error.WriteLine($"[WEB] http://{basicAuth}{ipAddress}:{httpPort}");
+                Console.Error.WriteLine($"[API] http://{basicAuth}{ipAddress}:{httpPort}/api/");
+
+                api.MapGet("/", () => Results.Content(WebPage.GetHtml(enableMjpeg), "text/html"));
+
+                api.MapPost("/api/ptz/right", () => { client.PtzRight(); LogUtils.debug("[API] PTZ Right"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/ptz/left", () => { client.PtzLeft(); LogUtils.debug("[API] PTZ Left"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/ptz/up", () => { client.PtzUp(); LogUtils.debug("[API] PTZ Up"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/ptz/down", () => { client.PtzDown(); LogUtils.debug("[API] PTZ Down"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/ptz/stop", () => { client.PtzStop(); LogUtils.debug("[API] PTZ Stop"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+
+                api.MapPost("/api/light/on", () => { client.LightOn(); LogUtils.debug("[API] Light On"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/light/off", () => { client.LightOff(); LogUtils.debug("[API] Light Off"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/siren/on", (int? seconds) => { var duration = Math.Clamp(seconds ?? 5, 1, 300); if (!client.SirenOn(duration)) return Results.Problem("Siren command could not be sent (no active stream)", statusCode: 503); LogUtils.debug($"[API] Siren On {duration}s"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/siren/off", () => { if (!client.SirenOff()) return Results.Problem("Siren command could not be sent (no active stream)", statusCode: 503); LogUtils.debug("[API] Siren Off"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/light/auto", () => { client.LightAuto(); LogUtils.debug("[API] Light Auto"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+
+                api.MapPost("/api/image/color", () => { client.ImageColor(); LogUtils.debug("[API] Image Color"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/image/bw", () => { client.ImageBW(); LogUtils.debug("[API] Image B&W"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/image/auto", () => { client.ImageAuto(); LogUtils.debug("[API] Image Auto"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+                api.MapPost("/api/image/flip", () => { client.ImageFlip(); LogUtils.debug("[API] Image Flip"); return Results.Ok(new StatusResponse { status = "ok", timestamp = DateTime.UtcNow }); });
+
+                api.MapGet("/api/status", () => Results.Ok(new StatusResponse
+                {
+                    status = "running",
+                    timestamp = DateTime.Now
+                }));
+            }
+
+            if (enableOnvif)
+            {
+                if (secure)
+                    Console.Error.WriteLine($"[ONVIF] http://{ipAddress}:{httpPort}/onvif/device_service (WS-Security enabled: {username})");
+                else
+                    Console.Error.WriteLine($"[ONVIF] http://{ipAddress}:{httpPort}/onvif/device_service");
+
+                var onvifGroup = app.MapGroup("/");
+
+                onvifGroup.MapPost("/onvif/device_service", async (HttpContext ctx) =>
+                await HandleOnvif(ctx));
+
+                onvifGroup.MapPost("/onvif/media_service", async (HttpContext ctx) =>
+                    await HandleOnvif(ctx));
+
+                onvifGroup.MapPost("/onvif/ptz_service", async (HttpContext ctx) =>
+                    await HandleOnvif(ctx));
+
+                onvifGroup.MapPost("/onvif/imaging_service", async (HttpContext ctx) =>
+                    await HandleOnvif(ctx));
+            }
+
+            Task.Run(() => app.Run());
+        }
+
+        private async Task HandleOnvif(HttpContext ctx)
+        {
+            string body = "";
+            using (var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8))
+            {
+                body = await reader.ReadToEndAsync();
+            }
+
+            string soapAction = ctx.Request.Headers["SOAPAction"].ToString();
+            string contentType = ctx.Request.Headers["Content-Type"].ToString();
+            var ctMatch = Regex.Match(contentType, @"action=""([^""]+)""", RegexOptions.IgnoreCase);
+            string rawAction = soapAction != "" ? soapAction
+                             : ctMatch.Success ? ctMatch.Groups[1].Value
+                             : "";
+
+            string action = rawAction.TrimEnd('/').Split('/').Last();
+            if (action.StartsWith("wsdl", StringComparison.OrdinalIgnoreCase) && action.Length > 4)
+                action = action.Substring(4);
+
+
+            string resp = OnvifHandler.Handle(action, body, ctx, client, httpPort, rtspPort, secure, username, password);
+
+            LogUtils.debug($"[ONVIF] response: {(resp.Length > 300 ? resp[..300] + "..." : resp)}");
+
+            ctx.Response.ContentType = "application/soap+xml; charset=utf-8";
+            await ctx.Response.WriteAsync(resp);
+        }
+
+        public void Stop()
+        {
+            app?.StopAsync().Wait();
+            app?.DisposeAsync().AsTask().Wait();
+        }
+    }
+}
