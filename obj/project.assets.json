@@ -149,11 +149,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "projectUniqueName": "C:\\C\\V380Decoder\\V380Decoder.csproj",
       "projectName": "V380Decoder",
-      "projectPath": "C:\\c\\V380Decoder\\V380Decoder.csproj",
+      "projectPath": "C:\\C\\V380Decoder\\V380Decoder.csproj",
       "packagesPath": "C:\\Users\\hbertorello\\.nuget\\packages\\",
-      "outputPath": "C:\\c\\V380Decoder\\obj\\",
+      "outputPath": "C:\\C\\V380Decoder\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\hbertorello\\AppData\\Roaming\\NuGet\\NuGet.Config"

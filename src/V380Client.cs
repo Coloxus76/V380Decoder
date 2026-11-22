@@ -258,6 +258,11 @@ namespace V380Decoder.src
                 Console.Error.WriteLine("[STREAM] login failed receive response");
                 return false;
             }
+            Console.Error.WriteLine($"[DUMP401] len={resp401.Length} hex={BitConverter.ToString(resp401, 0, Math.Min(resp401.Length, 64))}");
+if (resp401.Length >= 16)
+{
+    Console.Error.WriteLine($"[DUMP401] cmd={ReadUInt32LE(resp401, 0)} field4={unchecked((int)ReadUInt32LE(resp401, 4))} field8={unchecked((int)ReadUInt32LE(resp401, 8))} field12={ReadUInt32LE(resp401, 12)}");
+}
             var respCmd = ReadUInt32LE(resp401, 0);
             if (respCmd != 401)
             {
